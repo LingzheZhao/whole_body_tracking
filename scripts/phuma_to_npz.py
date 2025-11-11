@@ -1,23 +1,24 @@
-"""This script replay a motion from a csv file and output it to a npz file
+"""This script replays a PHUMA motion (.npy/.npz) and outputs it to a npz file
 
 .. code-block:: bash
 
     # Usage
-    python csv_to_npz.py --input_file LAFAN/dance1_subject2.csv --input_fps 30 --frame_range 122 722 \
-    --output_file ./motions/dance1_subject2.npz --output_fps 50
+    python phuma_to_npz.py --input_file /path/to/sequence.npy --frame_range 1 300 \
+    --output_name my_phuma_seq --output_fps 50
 """
 
 """Launch Isaac Sim Simulator first."""
 
 import argparse
 import numpy as np
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
-parser = argparse.ArgumentParser(description="Replay motion from csv file and output to npz file.")
-parser.add_argument("--input_file", type=str, required=True, help="The path to the input motion csv file.")
-parser.add_argument("--input_fps", type=int, default=30, help="The fps of the input motion.")
+parser = argparse.ArgumentParser(description="Replay PHUMA motion (.npy/.npz) and output to npz (wandb).")
+parser.add_argument("--input_file", type=str, required=True, help="Path to PHUMA file: .npy/.npz.")
+parser.add_argument("--input_fps", type=int, default=30, help="Fallback fps if PHUMA has no fps.")
 parser.add_argument(
     "--frame_range",
     nargs=2,
@@ -100,19 +101,24 @@ class MotionLoader:
         self._compute_velocities()
 
     def _load_motion(self):
-        """Loads the motion from the csv file."""
-        if self.frame_range is None:
-            motion = torch.from_numpy(np.loadtxt(self.motion_file, delimiter=","))
-        else:
-            motion = torch.from_numpy(
-                np.loadtxt(
-                    self.motion_file,
-                    delimiter=",",
-                    skiprows=self.frame_range[0] - 1,
-                    max_rows=self.frame_range[1] - self.frame_range[0] + 1,
-                )
-            )
-        motion = motion.to(torch.float32).to(self.device)
+        """Loads the motion from PHUMA (.npy/.npz)."""
+        path = Path(self.motion_file)
+        suffix = path.suffix.lower()
+        if suffix not in {".npy", ".npz"}:
+            raise ValueError(f"PHUMA file must be .npy or .npz, got: {suffix}")
+
+        motion_np, phuma_fps = self._load_phuma(path)
+        # Override input fps if PHUMA file provides one
+        if phuma_fps is not None:
+            self.input_fps = int(phuma_fps)
+            self.input_dt = 1.0 / self.input_fps
+        # Apply frame slicing if requested (inclusive indices in CLI)
+        if self.frame_range is not None:
+            start = max(self.frame_range[0] - 1, 0)
+            end = self.frame_range[1]
+            motion_np = motion_np[start:end, :]
+
+        motion = torch.from_numpy(motion_np).to(torch.float32).to(self.device)
         self.motion_base_poss_input = motion[:, :3]
         self.motion_base_rots_input = motion[:, 3:7]
         self.motion_base_rots_input = self.motion_base_rots_input[:, [3, 0, 1, 2]]  # convert to wxyz
@@ -121,6 +127,38 @@ class MotionLoader:
         self.input_frames = motion.shape[0]
         self.duration = (self.input_frames - 1) * self.input_dt
         print(f"Motion loaded ({self.motion_file}), duration: {self.duration} sec, frames: {self.input_frames}")
+
+    def _load_phuma(self, path: Path) -> tuple[np.ndarray, float | None]:
+        """Load PHUMA dict from .npy/.npz and return concatenated motion array and fps if present.
+
+        Expected keys:
+            - root_trans: (T, 3)
+            - root_ori: (T, 4) (xyzw)
+            - dof_pos: (T, num_dof)
+            - fps: number (optional)
+        """
+        if path.suffix.lower() == ".npz":
+            d = dict(**np.load(path, allow_pickle=True))
+        else:
+            arr = np.load(path, allow_pickle=True)
+            try:
+                d = dict(enumerate(arr.flatten()))[0]
+            except Exception:
+                try:
+                    d = arr.item()  # type: ignore[assignment]
+                except Exception:
+                    d = dict(arr)  # type: ignore[arg-type]
+
+        root_trans = np.asarray(d["root_trans"]).astype(np.float32)
+        root_ori = np.asarray(d["root_ori"]).astype(np.float32)  # xyzw
+        dof_pos = np.asarray(d["dof_pos"]).astype(np.float32)
+        fps_val = d.get("fps", None)
+        fps: float | None = float(fps_val) if fps_val is not None else None
+        assert (
+            root_trans.shape[0] == root_ori.shape[0] == dof_pos.shape[0]
+        ), "PHUMA arrays must have the same number of frames."
+        motion_np = np.concatenate([root_trans, root_ori, dof_pos], axis=1).astype(np.float32)
+        return motion_np, fps
 
     def _interpolate_motion(self):
         """Interpolates the motion to the output fps."""
@@ -370,3 +408,5 @@ if __name__ == "__main__":
     main()
     # close sim app
     simulation_app.close()
+
+
