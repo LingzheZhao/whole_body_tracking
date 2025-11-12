@@ -1,38 +1,426 @@
-"""Batch convert PHUMA motions (.npy/.npz) to npz and upload to Weights & Biases.
+"""Batch convert PHUMA motions (.npy/.npz) to npz and upload/link to Weights & Biases.
 
-Features
-- Input can be a single .npy/.npz file or a directory. Supports --recursive to walk all subdirectories.
-- For each motion, exports a /tmp/motion.npz artifact and uploads to wandb.
-- Preserves subfolder information in wandb by encoding the relative path into the run/artifact name:
-  'sub/dir/file.npy' -> 'sub__dir__file.npy'. The full relative path is also stored in run.config:
-  - config.rel_path  (e.g., 'sub/dir/file.npy')
-  - config.rel_dir   (e.g., 'sub/dir')
-  - config.filename  (e.g., 'file.npy')
-- Writes and appends to 'processed_motions.txt' in the input root. Each line is the relative path (with extension).
-  On restart, previously processed entries are skipped to support resumable processing.
-- Uses fps from PHUMA if present; otherwise falls back to --input_fps.
-- Supports per-sample frame slicing via --frame_range START END (inclusive).
-- Supports setting wandb entity via --wandb_entity.
+Overview
+- Discovers input files (.npy/.npz) in a directory (optionally recursive) or a single file.
+- Replays motion in Isaac/IsaacLab to export per-sample npz preserving relative folder structure.
+- Uploads exported npz artifacts to a WandB registry project and links them there.
+- Maintains resumable progress via processed_motions.txt (relative paths, one per line).
+- Supports startup synchronization with WandB to hydrate processed list and download missing npz.
 
-Usage
-.. code-block:: bash
+Key Arguments
+- --input_dir: File or directory containing PHUMA .npy/.npz.
+- --recursive/--no-recursive: Whether to walk subdirectories.
+- --input_fps / --output_fps / --frame_range: I/O frame rates and inclusive slicing.
+- --output_dir: Root directory to save local npz files mirroring input relative paths.
+- --upload_workers: Parallel uploader pool size (network I/O concurrency).
 
-    # Recursively process a directory tree of PHUMA files, 50 fps output
-    python batch_phuma_to_npz.py \\
-        --input_dir /path/to/phuma_root \\
-        --recursive \\
-        --output_fps 50 \\
-        --wandb_entity <your_wandb_entity>
+WandB Settings
+- --wandb_entity: Run owner entity (user or team). Note: Runs cannot be created under an organization.
+- --wandb_registry_entity: Registry owner entity (organization/team), e.g., 'cvgl-org'.
+- --wandb_registry_project: Registry project to link artifacts (e.g., 'wandb-registry-Motions').
+- Behavior:
+  - The script initializes the run under a non-org entity (tries --wandb_entity, its '-org' stripped form, then default).
+  - The artifact is then linked to the registry path:
+      '<wandb_registry_entity>/<wandb_registry_project>/<encoded_rel_name>'
+    If --wandb_registry_entity is not provided, falls back to '<wandb_registry_project>/<encoded_rel_name>'.
+  - Encoded name preserves folders by replacing '/' with '__'.
+- --sync_from_wandb:
+  - On startup, fetch runs from project 'csv_to_npz' and:
+    - Append missing rel_path entries to processed_motions.txt
+    - Download missing npz from registry into '--output_dir/<rel_path>.npz'
+  - The downloader tries multiple fully-qualified artifact specs, including org/team variants:
+    '{registry_entity}/{registry_project}/{name}:latest',
+    '{wandb_entity}-org/{registry_project}/{name}:latest',
+    '{wandb_entity}/{registry_project}/{name}:latest',
+    plus case variants and fallback to 'csv_to_npz' project.
 
-    # Process a single PHUMA file with frame slicing and custom fallback input fps
-    python batch_phuma_to_npz.py \\
-        --input_dir /path/to/seq.npy \\
-        --input_fps 30 \\
-        --frame_range 1 600 \\
-        --output_fps 50
+Resumable Processing
+- processed_motions.txt records relative paths (with extensions). On restart, those entries are skipped.
+- Entries are appended immediately after local save to reflect real-time progress.
+- File writes use a best-effort POSIX lock to reduce risk of corruption under multi-process/multi-instance writes.
+
+Notices
+- Entity vs Organization:
+  - WandB prohibits creating runs directly under organizations. Use a user/team entity for runs
+    (e.g., 'cvgl'), and a separate org/team entity for the registry (e.g., 'cvgl-org').
+  - If your visible registry full name is 'cvgl-org/wandb-registry-Motions/...', pass:
+      --wandb_entity cvgl --wandb_registry_entity cvgl-org --wandb_registry_project wandb-registry-Motions
+- Disk usage:
+  - Exported npz files are saved under '--output_dir' mirroring input structure. Ensure enough free space.
+- Performance:
+  - Increase '--upload_workers' to alleviate network bottlenecks. Simulation remains single-process by default.
+- Safety:
+  - If multiple script instances point to the same processed_motions.txt, locking reduces but cannot fully
+    eliminate cross-process race conditions on non-POSIX systems.
 """
+from __future__ import annotations
 
-"""Launch Isaac Sim Simulator first."""
+
+PROJECT_NAME = "csv_to_npz"
+REGISTRY_NAME = "motions"
+
+
+class ProcessedListManager:
+    """Manage the processed_motions.txt with locking and fast membership checks."""
+
+    def __init__(self, base_root: Path):
+        self.base_root = base_root
+        self.path = (base_root if base_root.is_dir() else base_root.parent) / "processed_motions.txt"
+        self.processed_rel_set: set[str] = set()
+        self.processed_stem_set: set[str] = set()
+
+    def load(self) -> None:
+        if self.path.exists():
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        entry = line.strip()
+                        if entry:
+                            self.processed_rel_set.add(entry)
+                            self.processed_stem_set.add(Path(entry).stem)
+                print(f"[INFO]: Loaded {len(self.processed_rel_set)} processed entries from {self.path}")
+            except Exception as e:
+                print(f"[WARN]: Failed to read processed list {self.path}: {e}")
+
+    def append(self, rel_entry: str) -> None:
+        if rel_entry not in self.processed_rel_set:
+            _append_with_lock(self.path, rel_entry + "\n")
+            self.processed_rel_set.add(rel_entry)
+            self.processed_stem_set.add(Path(rel_entry).stem)
+
+    def contains(self, rel_entry: str) -> bool:
+        return rel_entry in self.processed_rel_set or Path(rel_entry).stem in self.processed_stem_set
+
+
+class WandbRegistry:
+    """Encapsulate Weights & Biases interactions (upload and sync)."""
+
+    def __init__(self, entity: str | None, registry_project: str, registry_entity: str | None):
+        self.entity = entity
+        self.registry_project = registry_project
+        self.registry_entity = registry_entity
+        # Common project name used to create runs
+        self.run_project = PROJECT_NAME
+
+    # ---------------------------- helpers (paths/entities) ----------------------------
+    def build_collection_name(self, rel_entry: str) -> str:
+        return rel_entry.replace("/", "__").replace("\\", "__")
+
+    def build_target_path(self, collection: str) -> str:
+        if self.registry_entity:
+            return f"{self.registry_entity}/{self.registry_project}/{collection}"
+        return f"{self.registry_project}/{collection}"
+
+    def candidate_run_entities(self) -> list[str | None]:
+        candidates: list[str | None] = []
+        if self.entity:
+            candidates.append(self.entity)
+            if self.entity.endswith("-org"):
+                candidates.append(self.entity[:-4])
+        candidates.append(None)  # default logged-in
+        # deduplicate while preserving order
+        seen = set()
+        return [e for e in candidates if not (e in seen or seen.add(e))]
+
+    def candidate_artifact_specs(self, collection: str, fallback_project: str) -> list[str]:
+        entities: list[str] = []
+        if self.registry_entity:
+            entities.append(self.registry_entity)
+        if self.entity:
+            entities.append(self.entity)
+            entities.append(f"{self.entity}-org")
+        seen = set()
+        entities = [e for e in entities if e and not (e in seen or seen.add(e))]
+        specs: list[str] = []
+        for ent in entities:
+            specs.append(f"{ent}/{self.registry_project}/{collection}:latest")
+            specs.append(f"{ent}/wandb-registry-Motions/{collection}:latest")
+            specs.append(f"{ent}/wandb-registry-motions/{collection}:latest")
+            specs.append(f"{ent}/{fallback_project}/{collection}:latest")
+        specs.append(f"{self.registry_project}/{collection}:latest")
+        specs.append(f"wandb-registry-Motions/{collection}:latest")
+        specs.append(f"wandb-registry-motions/{collection}:latest")
+        specs.append(f"{fallback_project}/{collection}:latest")
+        return specs
+
+    def serialize(self) -> dict:
+        return {
+            "entity": self.entity,
+            "registry_project": self.registry_project,
+            "registry_entity": self.registry_entity,
+            "run_project": self.run_project,
+        }
+
+    # ---------------------------- public API (used by caller) ----------------------------
+    def upload_async(self, pool: "mp.pool.Pool", npz_path: Path, rel_entry: str) -> "mp.pool.ApplyResult":  # type: ignore[name-defined]
+        cfg = self.serialize()
+        return pool.apply_async(_uploader_task, args=(npz_path.as_posix(), rel_entry, cfg))
+
+    def sync(self, processed: "ProcessedListManager", output_dir: Path) -> None:
+        cfg = self.serialize()
+        _sync_processed_from_wandb(processed.path, processed.processed_rel_set, processed.processed_stem_set, output_dir, cfg)
+
+    # ---------------------------- static utilities (used in workers) ----------------------------
+    @staticmethod
+    def upload_with_cfg(npz_path: str, rel_entry: str, cfg: dict) -> bool:
+        import wandb
+        collection = rel_entry.replace("/", "__").replace("\\", "__")
+        # choose run entity
+        entity = cfg.get("entity")
+        registry_entity = cfg.get("registry_entity")
+        registry_project = cfg.get("registry_project")
+        run_project = cfg.get("run_project", PROJECT_NAME)
+        candidate_run_entities: list[str | None] = []
+        if entity:
+            candidate_run_entities.append(entity)
+            if isinstance(entity, str) and entity.endswith("-org"):
+                candidate_run_entities.append(entity[:-4])
+        candidate_run_entities.append(None)
+        run = None
+        last_err: Exception | None = None
+        for run_entity in [e for i, e in enumerate(candidate_run_entities) if e not in candidate_run_entities[:i]]:
+            try:
+                run = wandb.init(
+                    project=run_project,
+                    name=collection,
+                    entity=run_entity,
+                    reinit=True,
+                    config={
+                        "rel_path": rel_entry,
+                        "rel_dir": str(Path(rel_entry).parent.as_posix()),
+                        "filename": Path(rel_entry).name,
+                    },
+                )
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                continue
+        if run is None:
+            print(f"[WARN][upload] Failed to init wandb run for {collection}: {last_err}")
+            return False
+        print(f"[INFO][upload] Logging motion to wandb: {collection}")
+        logged_artifact = run.log_artifact(artifact_or_path=npz_path, name=collection, type="motions")
+        # target path
+        if registry_entity:
+            target_path = f"{registry_entity}/{registry_project}/{collection}"
+        else:
+            target_path = f"{registry_project}/{collection}"
+        run.link_artifact(artifact=logged_artifact, target_path=target_path)
+        print(f"[INFO][upload] Motion saved to wandb registry: {target_path} (rel={rel_entry})")
+        try:
+            run.finish()
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def download_with_cfg(rel_entry: str, target_npz: Path, cfg: dict) -> bool:
+        import wandb
+        api = wandb.Api()
+        collection = rel_entry.replace("/", "__").replace("\\", "__")
+        registry_project = cfg.get("registry_project")
+        entity = cfg.get("entity")
+        registry_entity = cfg.get("registry_entity")
+        run_project = cfg.get("run_project", PROJECT_NAME)
+        # build candidates
+        probe_entities: list[str] = []
+        if registry_entity:
+            probe_entities.append(registry_entity)
+        if entity:
+            probe_entities.append(entity)
+            probe_entities.append(f"{entity}-org")
+        seen = set()
+        probe_entities = [e for e in probe_entities if e and not (e in seen or seen.add(e))]
+        candidates: list[str] = []
+        for ent in probe_entities:
+            candidates.append(f"{ent}/{registry_project}/{collection}:latest")
+            candidates.append(f"{ent}/wandb-registry-Motions/{collection}:latest")
+            candidates.append(f"{ent}/wandb-registry-motions/{collection}:latest")
+            candidates.append(f"{ent}/{run_project}/{collection}:latest")
+        candidates.append(f"{registry_project}/{collection}:latest")
+        candidates.append(f"wandb-registry-Motions/{collection}:latest")
+        candidates.append(f"wandb-registry-motions/{collection}:latest")
+        candidates.append(f"{run_project}/{collection}:latest")
+        artifact = None
+        for spec in candidates:
+            try:
+                artifact = api.artifact(spec)
+                break
+            except Exception:
+                artifact = None
+        if artifact is None:
+            print(f"[WARN]: Artifact not found on wandb for {collection}. Tried: {candidates}")
+            return False
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dl_dir = Path(artifact.download(root=tmpdir))
+            found = None
+            for p in dl_dir.rglob("*.npz"):
+                found = p
+                break
+            if found is None:
+                print(f"[WARN]: No .npz found in artifact {collection}")
+                return False
+            target_npz.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(found.as_posix(), target_npz.as_posix())
+        return True
+
+    @staticmethod
+    def sync_runs_with_cfg(
+        out_txt: Path, processed_rel_set: set[str], processed_stem_set: set[str], output_dir: Path, cfg: dict
+    ) -> None:
+        import wandb
+        api = wandb.Api()
+        # choose project path for runs
+        sync_project = args_cli.wandb_sync_project  # use CLI for project name
+        probe_entities: list[str] = []
+        if args_cli.wandb_sync_entity:
+            probe_entities.append(args_cli.wandb_sync_entity)
+        entity = cfg.get("entity")
+        registry_entity = cfg.get("registry_entity")
+        if entity:
+            probe_entities.append(entity)
+            probe_entities.append(f"{entity}-org")
+        if registry_entity:
+            probe_entities.append(registry_entity)
+        seen = set()
+        probe_entities = [e for e in probe_entities if e and not (e in seen or seen.add(e))]
+        runs = []
+        last_err: Exception | None = None
+        last_project_path = None
+        for ent in probe_entities:
+            project_path = f"{ent}/{sync_project}"
+            try:
+                runs = api.runs(project_path)
+                last_project_path = project_path
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if not runs:
+            project_path = sync_project
+            try:
+                runs = api.runs(project_path)
+                last_project_path = project_path
+            except Exception as e:
+                last_err = e
+                raise RuntimeError(
+                    f"Could not find project to sync. Tried entities={probe_entities} project={sync_project}. "
+                    f"Last error: {last_err}"
+                ) from e
+        print(f"[INFO]: Found {len(runs)} runs in {last_project_path}")
+        synced = 0
+        downloaded = 0
+        for run in runs:
+            try:
+                rel = run.config.get("rel_path", None)
+            except Exception:
+                rel = None
+            if isinstance(rel, str) and rel:
+                if rel not in processed_rel_set:
+                    _append_with_lock(out_txt, rel + "\n")
+                    processed_rel_set.add(rel)
+                    processed_stem_set.add(Path(rel).stem)
+                    synced += 1
+                target_npz = (output_dir / rel).with_suffix(".npz")
+                if not target_npz.exists():
+                    if WandbRegistry.download_with_cfg(rel, target_npz, cfg):
+                        downloaded += 1
+        print(f"[INFO]: Synced {synced} entries from wandb to {out_txt}")
+        print(f"[INFO]: Downloaded {downloaded} missing npz file(s) into {output_dir}")
+
+
+class MotionExporter:
+    """Export one motion to npz and record processed entry immediately after local save."""
+
+    def __init__(
+        self,
+        sim: sim_utils.SimulationContext,
+        scene: InteractiveScene,
+        joint_names: list[str],
+        output_dir: Path,
+        processed: ProcessedListManager,
+    ):
+        self.sim = sim
+        self.scene = scene
+        self.joint_names = joint_names
+        self.output_dir = output_dir
+        self.processed = processed
+
+    def export(self, motion_file: Path, rel_entry: str) -> Path | None:
+        return _run_single_motion(
+            sim=self.sim,
+            scene=self.scene,
+            joint_names=self.joint_names,
+            motion_file=motion_file,
+            rel_entry=rel_entry,
+            output_dir=self.output_dir,
+            out_txt=self.processed.path,
+        )
+
+
+class BatchPhumaProcessor:
+    """High-level batch processor for PHUMA conversion with parallel uploads."""
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.input_dir = Path(args.input_dir)
+        self.base_root = self.input_dir if self.input_dir.is_dir() else self.input_dir.parent
+        self.output_dir = Path(args.output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.processed = ProcessedListManager(self.input_dir)
+        self.wandb = WandbRegistry(args.wandb_entity, args.wandb_registry_project, args.wandb_registry_entity)
+
+    def discover_inputs(self) -> list[Path]:
+        files: list[Path] = []
+        if self.input_dir.is_file():
+            assert self.input_dir.suffix.lower() in {".npy", ".npz"}
+            files.append(self.input_dir)
+        else:
+            if self.args.recursive:
+                for root, _, fnames in os.walk(self.input_dir):
+                    root_path = Path(root)
+                    for fn in fnames:
+                        if fn.endswith(".npy") or fn.endswith(".npz"):
+                            files.append(root_path / fn)
+            else:
+                for fn in os.listdir(self.input_dir):
+                    if fn.endswith(".npy") or fn.endswith(".npz"):
+                        files.append(self.input_dir / fn)
+        files = sorted(files)
+        assert len(files) > 0, f"No .npy/.npz files found in {self.input_dir}"
+        print(f"[INFO]: Found {len(files)} PHUMA file(s) in {self.input_dir} (recursive={self.args.recursive})")
+        return files
+
+    def run(self, sim: sim_utils.SimulationContext, scene: InteractiveScene, joint_names: list[str]) -> None:
+        self.processed.load()
+        if self.args.sync_from_wandb:
+            self.wandb.sync(self.processed, self.output_dir)
+        exporter = MotionExporter(sim, scene, joint_names, self.output_dir, self.processed)
+        files = self.discover_inputs()
+
+        pool = mp.Pool(processes=max(1, int(self.args.upload_workers)))
+        pending: list[tuple[str, "mp.pool.ApplyResult"]] = []  # type: ignore[name-defined]
+        for f in files:
+            rel = f.relative_to(self.base_root).as_posix()
+            if self.processed.contains(rel):
+                continue
+            saved = exporter.export(f, rel)
+            if saved is not None:
+                pending.append((rel, self.wandb.upload_async(pool, saved, rel)))
+        pool.close()
+        uploaded = 0
+        for rel, res in pending:
+            ok = False
+            try:
+                ok = bool(res.get())
+            except Exception as e:
+                print(f"[WARN]: Upload failed for {rel}: {e}")
+            if ok:
+                uploaded += 1
+        pool.join()
+        print(f"[INFO]: Saved processed list to {self.processed.path}")
+        print(f"[INFO]: Successfully uploaded {uploaded} item(s).")
+
 
 import os
 import multiprocessing as mp
@@ -73,6 +461,32 @@ parser.add_argument(
     "--sync_from_wandb",
     action="store_true",
     help="At startup, cross-check wandb runs (project csv_to_npz) and sync processed_motions.txt.",
+)
+parser.add_argument(
+    "--wandb_registry_project",
+    type=str,
+    default="wandb-registry-Motions",
+    help="W&B registry project that stores finalized artifacts (e.g., 'wandb-registry-Motions').",
+)
+parser.add_argument(
+    "--wandb_registry_entity",
+    type=str,
+    default=None,
+    help="W&B entity/org that owns the registry project (e.g., 'cvgl-org'). If not provided, we will try "
+    "both --wandb_entity and a derived '<wandb_entity>-org' alias.",
+)
+parser.add_argument(
+    "--wandb_sync_project",
+    type=str,
+    default="csv_to_npz",
+    help="Project to read runs from when --sync_from_wandb is enabled (default: csv_to_npz).",
+)
+parser.add_argument(
+    "--wandb_sync_entity",
+    type=str,
+    default=None,
+    help="Entity/team to read runs from when --sync_from_wandb is enabled. If not provided, we try "
+    "--wandb_entity, '<wandb_entity>-org', and --wandb_registry_entity in order.",
 )
 
 # append AppLauncher cli args
@@ -395,140 +809,19 @@ def run_simulator(
     scene: InteractiveScene,
     joint_names: list[str]
 ):
-    """Runs the simulation loop."""
-    input_files = []
-    input_dir = Path(args_cli.input_dir)
-    if input_dir.is_file():
-        assert input_dir.suffix.lower() in {".npy", ".npz"}, "Input file must be .npy or .npz."
-        input_files.append(input_dir)
-    elif input_dir.is_dir():
-        if args_cli.recursive:
-            for root, _, files in os.walk(input_dir):
-                root_path = Path(root)
-                for file in files:
-                    if file.endswith(".npy") or file.endswith(".npz"):
-                        input_files.append(root_path / file)
-        else:
-            for file in os.listdir(input_dir):
-                if file.endswith(".npy") or file.endswith(".npz"):
-                    input_files.append(input_dir / file)
-    else:
-        raise ValueError(f"Input path {input_dir} is not a file or directory.")
-
-    input_files = sorted(input_files)  # TODO: change to natural sort if needed
-    assert len(input_files) > 0, f"No .npy/.npz files found in {input_dir}"
-    print(f"[INFO]: Found {len(input_files)} PHUMA file(s) in {input_dir} (recursive={args_cli.recursive})")
-
-    # Load existing processed list for resume
-    list_path = input_dir if input_dir.is_dir() else input_dir.parent
-    out_txt = list_path / "processed_motions.txt"
-    base_root = input_dir if input_dir.is_dir() else input_dir.parent
-    processed_rel_set = set()
-    processed_stem_set = set()
-    if out_txt.exists():
-        try:
-            with open(out_txt, "r", encoding="utf-8") as f:
-                for line in f:
-                    entry = line.strip()
-                    if entry:
-                        processed_rel_set.add(entry)
-                        processed_stem_set.add(Path(entry).stem)
-            print(f"[INFO]: Loaded {len(processed_rel_set)} processed entries from {out_txt}")
-        except Exception as e:
-            print(f"[WARN]: Failed to read processed list {out_txt}: {e}")
-
-    # Optionally sync from wandb: treat wandb runs as source of truth
-    if args_cli.sync_from_wandb:
-        _sync_processed_from_wandb(out_txt, processed_rel_set, processed_stem_set, Path(args_cli.output_dir))
-
-    # Prepare multiprocessing pool for parallel uploads
-    upload_pool = mp.Pool(processes=max(1, int(args_cli.upload_workers)))
-    # Use Any type for async result to avoid type checking issues
-    pending_results: list[tuple[str, "mp.pool.ApplyResult"]] = []  # type: ignore[name-defined]
-
-    # Ensure output dir exists
-    output_dir = Path(args_cli.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for input_file in input_files:
-        rel_entry = input_file.relative_to(base_root).as_posix()
-        if rel_entry in processed_rel_set or input_file.stem in processed_stem_set:
-            continue
-        saved_npz = _run_single_motion(sim, scene, joint_names, input_file, rel_entry, output_dir, out_txt)
-        # Schedule upload task
-        if saved_npz is not None:
-            pending_results.append(
-                (
-                    rel_entry,
-                    upload_pool.apply_async(
-                        _uploader_task,
-                        args=(
-                            saved_npz.as_posix(),
-                            rel_entry,
-                            args_cli.wandb_entity,
-                        ),
-                    ),
-                )
-            )
-
-    # Close pool inputs; continue processing results
-    upload_pool.close()
-    # Collect upload results (already marked as processed on save)
-    success_count = 0
-    for rel_entry, async_res in pending_results:
-        ok = False
-        try:
-            ok = bool(async_res.get())
-        except Exception as e:
-            print(f"[WARN]: Upload failed for {rel_entry}: {e}")
-        if ok:
-            success_count += 1
-    upload_pool.join()
-
-    print(f"[INFO]: Saved processed list to {out_txt}")
-    print(f"[INFO]: Successfully uploaded {success_count} item(s).")
-
+    """Run the batch processor to export and upload motions."""
+    processor = BatchPhumaProcessor(args_cli)
+    processor.run(sim, scene, joint_names)
     print("[INFO]: All motions processed.")
-    # close sim app
     simulation_app.close()
 
 
-def _uploader_task(npz_path: str, rel_entry: str, wandb_entity: str | None) -> bool:
+def _uploader_task(npz_path: str, rel_entry: str, registry_cfg: dict) -> bool:
     """Upload a saved npz to wandb as an artifact. Runs in a worker process."""
     try:
-        import wandb
-        collection = rel_entry.replace("/", "__").replace("\\", "__")
-        run = wandb.init(
-            project="csv_to_npz",
-            name=collection,
-            entity=wandb_entity,
-            reinit=True,
-            config={
-                "rel_path": rel_entry,
-                "rel_dir": str(Path(rel_entry).parent.as_posix()),
-                "filename": Path(rel_entry).name,
-            },
-        )
-        print(f"[INFO][upload] Logging motion to wandb: {collection}")
-        registry = "motions"
-        logged_artifact = run.log_artifact(
-            artifact_or_path=npz_path, name=collection, type=registry
-        )
-        run.link_artifact(
-            artifact=logged_artifact, target_path=f"wandb-registry-{registry}/{collection}"
-        )
-        print(f"[INFO][upload] Motion saved to wandb registry: {registry}/{collection} (rel={rel_entry})")
-        try:
-            run.finish()
-        except Exception:
-            pass
-        return True
+        return WandbRegistry.upload_with_cfg(npz_path, rel_entry, registry_cfg)
     except Exception as e:
         print(f"[WARN][upload] Failed to log to wandb for {rel_entry}: {e}")
-        try:
-            run.finish()  # type: ignore[union-attr]
-        except Exception:
-            pass
         return False
 
 
@@ -555,38 +848,18 @@ def _append_with_lock(file_path: Path, text: str) -> None:
 
 
 def _sync_processed_from_wandb(
-    out_txt: Path, processed_rel_set: set[str], processed_stem_set: set[str], output_dir: Path
+    out_txt: Path, processed_rel_set: set[str], processed_stem_set: set[str], output_dir: Path, registry_cfg: dict | None = None
 ) -> None:
     """Sync processed list and local files from wandb runs (project 'csv_to_npz') using run.config.rel_path.
     If an entry exists on wandb but the local output file is missing, download it to output_dir/rel_path."""
     try:
-        import wandb
-        api = wandb.Api()
-        project_path = (
-            f"{args_cli.wandb_entity}/csv_to_npz" if args_cli.wandb_entity else "csv_to_npz"
-        )
-        runs = api.runs(project_path)
-        synced = 0
-        downloaded = 0
-        for run in runs:
-            try:
-                rel = run.config.get("rel_path", None)
-            except Exception:
-                rel = None
-            if isinstance(rel, str) and rel:
-                if rel not in processed_rel_set:
-                    _append_with_lock(out_txt, rel + "\n")
-                    processed_rel_set.add(rel)
-                    processed_stem_set.add(Path(rel).stem)
-                    synced += 1
-                # Ensure local file exists, otherwise download from artifact registry
-                target_npz = (output_dir / rel).with_suffix(".npz")
-                if not target_npz.exists():
-                    ok = _download_npz_from_wandb(rel, target_npz)
-                    if ok:
-                        downloaded += 1
-        print(f"[INFO]: Synced {synced} entries from wandb to {out_txt}")
-        print(f"[INFO]: Downloaded {downloaded} missing npz file(s) into {output_dir}")
+        cfg = registry_cfg or {
+            "entity": args_cli.wandb_entity,
+            "registry_entity": args_cli.wandb_registry_entity,
+            "registry_project": args_cli.wandb_registry_project,
+            "run_project": PROJECT_NAME,
+        }
+        return WandbRegistry.sync_runs_with_cfg(out_txt, processed_rel_set, processed_stem_set, output_dir, cfg)
     except Exception as e:
         print(f"[WARN]: Failed to sync from wandb: {e}")
 
@@ -594,42 +867,13 @@ def _sync_processed_from_wandb(
 def _download_npz_from_wandb(rel_entry: str, target_npz: Path) -> bool:
     """Download artifact for rel_entry to target_npz. Returns True on success."""
     try:
-        import wandb
-        api = wandb.Api()
-        collection = rel_entry.replace("/", "__").replace("\\", "__")
-        # Try with entity if provided; else fall back to default resolution
-        spec_with_entity = (
-            f"{args_cli.wandb_entity}/csv_to_npz/motions/{collection}:latest"
-            if args_cli.wandb_entity
-            else None
-        )
-        candidates = []
-        if spec_with_entity:
-            candidates.append(spec_with_entity)
-        candidates.append(f"csv_to_npz/motions/{collection}:latest")
-        artifact = None
-        for spec in candidates:
-            try:
-                artifact = api.artifact(spec)
-                break
-            except Exception:
-                artifact = None
-        if artifact is None:
-            print(f"[WARN]: Artifact not found on wandb for {collection}")
-            return False
-        with tempfile.TemporaryDirectory() as tmpdir:
-            dl_dir = Path(artifact.download(root=tmpdir))
-            # Find first .npz inside downloaded dir
-            found = None
-            for p in dl_dir.rglob("*.npz"):
-                found = p
-                break
-            if found is None:
-                print(f"[WARN]: No .npz found in artifact {collection}")
-                return False
-            target_npz.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(found.as_posix(), target_npz.as_posix())
-        return True
+        cfg = {
+            "entity": args_cli.wandb_entity,
+            "registry_entity": args_cli.wandb_registry_entity,
+            "registry_project": args_cli.wandb_registry_project,
+            "run_project": PROJECT_NAME,
+        }
+        return WandbRegistry.download_with_cfg(rel_entry, target_npz, cfg)
     except Exception as e:
         print(f"[WARN]: Failed to download artifact for {rel_entry}: {e}")
         return False
