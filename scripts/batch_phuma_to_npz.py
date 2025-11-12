@@ -25,14 +25,21 @@ WandB Settings
     If --wandb_registry_entity is not provided, falls back to '<wandb_registry_project>/<encoded_rel_name>'.
   - Encoded name preserves folders by replacing '/' with '__'.
 - --sync_from_wandb:
-  - On startup, fetch runs from project 'csv_to_npz' and:
-    - Append missing rel_path entries to processed_motions.txt
-    - Download missing npz from registry into '--output_dir/<rel_path>.npz'
+  - On startup, sync from WandB REGISTRY (artifact collections), not from runs:
+    - Append any missing rel_path (decoded from collection names) into processed_motions.txt
+    - Download missing npz into '--output_dir/<rel_path>.npz'
   - The downloader tries multiple fully-qualified artifact specs, including org/team variants:
     '{registry_entity}/{registry_project}/{name}:latest',
     '{wandb_entity}-org/{registry_project}/{name}:latest',
     '{wandb_entity}/{registry_project}/{name}:latest',
-    plus case variants and fallback to 'csv_to_npz' project.
+    and case variants, plus fallback to the run project if needed.
+
+Verification (enabled by default)
+- --verify_uploaded / --no-verify-uploaded:
+  - If enabled (default), the script checks all entries in processed_motions.txt against the WandB registry.
+  - Missing entries are written to '--missing_list_name' in the input root.
+- --missing_list_name:
+  - Name of the report file for missing entries. Default: 'missing_in_wandb.txt'.
 
 Resumable Processing
 - processed_motions.txt records relative paths (with extensions). On restart, those entries are skipped.
@@ -265,66 +272,95 @@ class WandbRegistry:
         return True
 
     @staticmethod
+    def artifact_exists_with_cfg(rel_entry: str, cfg: dict) -> bool:
+        """Return True if the artifact for rel_entry exists in WandB registry."""
+        import wandb
+        api = wandb.Api()
+        collection = rel_entry.replace("/", "__").replace("\\", "__")
+        registry_project = cfg.get("registry_project")
+        entity = cfg.get("entity")
+        registry_entity = cfg.get("registry_entity")
+        run_project = cfg.get("run_project", PROJECT_NAME)
+        probe_entities: list[str] = []
+        if registry_entity:
+            probe_entities.append(registry_entity)
+        if entity:
+            probe_entities.append(entity)
+            probe_entities.append(f"{entity}-org")
+        seen = set()
+        probe_entities = [e for e in probe_entities if e and not (e in seen or seen.add(e))]
+        candidates: list[str] = []
+        for ent in probe_entities:
+            candidates.append(f"{ent}/{registry_project}/{collection}:latest")
+            candidates.append(f"{ent}/wandb-registry-Motions/{collection}:latest")
+            candidates.append(f"{ent}/wandb-registry-motions/{collection}:latest")
+            candidates.append(f"{ent}/{run_project}/{collection}:latest")
+        candidates.append(f"{registry_project}/{collection}:latest")
+        candidates.append(f"wandb-registry-Motions/{collection}:latest")
+        candidates.append(f"wandb-registry-motions/{collection}:latest")
+        candidates.append(f"{run_project}/{collection}:latest")
+        for spec in candidates:
+            try:
+                _ = api.artifact(spec)
+                return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
     def sync_runs_with_cfg(
         out_txt: Path, processed_rel_set: set[str], processed_stem_set: set[str], output_dir: Path, cfg: dict
     ) -> None:
         import wandb
         api = wandb.Api()
-        # choose project path for runs
-        sync_project = args_cli.wandb_sync_project  # use CLI for project name
-        probe_entities: list[str] = []
-        if args_cli.wandb_sync_entity:
-            probe_entities.append(args_cli.wandb_sync_entity)
+        print("[INFO]: Syncing from WandB registry (collections) ...")
+        # Resolve a registry artifact type first
+        registry_project = cfg.get("registry_project")
         entity = cfg.get("entity")
         registry_entity = cfg.get("registry_entity")
-        if entity:
-            probe_entities.append(entity)
-            probe_entities.append(f"{entity}-org")
+        # candidates for project path to fetch artifact type
+        proj_candidates: list[str] = []
         if registry_entity:
-            probe_entities.append(registry_entity)
-        seen = set()
-        probe_entities = [e for e in probe_entities if e and not (e in seen or seen.add(e))]
-        runs = []
+            proj_candidates.append(f"{registry_entity}/{registry_project}")
+        if entity:
+            proj_candidates.append(f"{entity}/{registry_project}")
+            proj_candidates.append(f"{entity}-org/{registry_project}")
+        if registry_project:
+            proj_candidates.append(registry_project)  # no entity fallback
+        art_type = None
         last_err: Exception | None = None
         last_project_path = None
-        for ent in probe_entities:
-            project_path = f"{ent}/{sync_project}"
+        for proj in proj_candidates:
             try:
-                runs = api.runs(project_path)
-                last_project_path = project_path
+                art_type = api.artifact_type(proj, REGISTRY_NAME)
+                last_project_path = proj
                 break
             except Exception as e:
                 last_err = e
                 continue
-        if not runs:
-            project_path = sync_project
-            try:
-                runs = api.runs(project_path)
-                last_project_path = project_path
-            except Exception as e:
-                last_err = e
-                raise RuntimeError(
-                    f"Could not find project to sync. Tried entities={probe_entities} project={sync_project}. "
-                    f"Last error: {last_err}"
-                ) from e
-        print(f"[INFO]: Found {len(runs)} runs in {last_project_path}")
+        if art_type is None:
+            raise RuntimeError(f"Could not locate artifact type '{REGISTRY_NAME}' under candidates: {proj_candidates}. "
+                               f"Last error: {last_err}")
+        # iterate collections (one per encoded relative path)
+        collections = list(art_type.collections())
+        print(f"[INFO]: Found {len(collections)} collections in {last_project_path} (type={REGISTRY_NAME})")
         synced = 0
         downloaded = 0
-        for run in runs:
+        for coll in collections:
             try:
-                rel = run.config.get("rel_path", None)
+                encoded_name = coll.name
+                rel = encoded_name.replace("__", "/")
             except Exception:
-                rel = None
-            if isinstance(rel, str) and rel:
-                if rel not in processed_rel_set:
-                    _append_with_lock(out_txt, rel + "\n")
-                    processed_rel_set.add(rel)
-                    processed_stem_set.add(Path(rel).stem)
-                    synced += 1
-                target_npz = (output_dir / rel).with_suffix(".npz")
-                if not target_npz.exists():
-                    if WandbRegistry.download_with_cfg(rel, target_npz, cfg):
-                        downloaded += 1
+                continue
+            if rel not in processed_rel_set:
+                _append_with_lock(out_txt, rel + "\n")
+                processed_rel_set.add(rel)
+                processed_stem_set.add(Path(rel).stem)
+                synced += 1
+            target_npz = (output_dir / rel).with_suffix(".npz")
+            if not target_npz.exists():
+                if WandbRegistry.download_with_cfg(rel, target_npz, cfg):
+                    downloaded += 1
         print(f"[INFO]: Synced {synced} entries from wandb to {out_txt}")
         print(f"[INFO]: Downloaded {downloaded} missing npz file(s) into {output_dir}")
 
@@ -395,6 +431,20 @@ class BatchPhumaProcessor:
         self.processed.load()
         if self.args.sync_from_wandb:
             self.wandb.sync(self.processed, self.output_dir)
+        if self.args.verify_uploaded:
+            cfg = self.wandb.serialize()
+            missing: list[str] = []
+            for rel in sorted(self.processed.processed_rel_set):
+                if not WandbRegistry.artifact_exists_with_cfg(rel, cfg):
+                    missing.append(rel)
+            missing_path = (self.processed.path.parent / self.args.missing_list_name)
+            try:
+                with open(missing_path, "w", encoding="utf-8") as f:
+                    for rel in missing:
+                        f.write(rel + "\n")
+                print(f"[INFO]: Verified processed entries. Missing in WandB: {len(missing)}. Saved to {missing_path}")
+            except Exception as e:
+                print(f"[WARN]: Failed to write missing list: {e}")
         exporter = MotionExporter(sim, scene, joint_names, self.output_dir, self.processed)
         files = self.discover_inputs()
 
@@ -460,7 +510,8 @@ parser.add_argument(
 parser.add_argument(
     "--sync_from_wandb",
     action="store_true",
-    help="At startup, cross-check wandb runs (project csv_to_npz) and sync processed_motions.txt.",
+    help="At startup, sync processed_motions.txt from WandB REGISTRY (artifact collections),"
+    " and download missing npz files to --output_dir.",
 )
 parser.add_argument(
     "--wandb_registry_project",
@@ -478,16 +529,33 @@ parser.add_argument(
 parser.add_argument(
     "--wandb_sync_project",
     type=str,
-    default="csv_to_npz",
-    help="Project to read runs from when --sync_from_wandb is enabled (default: csv_to_npz).",
+    default=None,
+    help="Deprecated: previously used to read runs; now unused since registry sync is default.",
 )
 parser.add_argument(
     "--wandb_sync_entity",
     type=str,
     default=None,
-    help="Entity/team to read runs from when --sync_from_wandb is enabled. If not provided, we try "
-    "--wandb_entity, '<wandb_entity>-org', and --wandb_registry_entity in order.",
+    help="Deprecated: previously used to read runs; now unused since registry sync is default.",
 )
+parser.add_argument(
+    "--verify_uploaded",
+    action="store_true",
+    help="Verify entries in processed_motions.txt exist in WandB registry (writes a missing list).",
+)
+parser.add_argument(
+    "--missing_list_name",
+    type=str,
+    default="missing_in_wandb.txt",
+    help="Filename to write motions not found in WandB registry (relative to input root). Default: missing_in_wandb.txt",
+)
+parser.add_argument(
+    "--no-verify-uploaded",
+    dest="verify_uploaded",
+    action="store_false",
+    help="Disable verification step against WandB registry.",
+)
+parser.set_defaults(verify_uploaded=True)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -850,8 +918,8 @@ def _append_with_lock(file_path: Path, text: str) -> None:
 def _sync_processed_from_wandb(
     out_txt: Path, processed_rel_set: set[str], processed_stem_set: set[str], output_dir: Path, registry_cfg: dict | None = None
 ) -> None:
-    """Sync processed list and local files from wandb runs (project 'csv_to_npz') using run.config.rel_path.
-    If an entry exists on wandb but the local output file is missing, download it to output_dir/rel_path."""
+    """Sync processed list and local files from WandB REGISTRY (artifact collections).
+    If an entry exists on WandB but the local output file is missing, download it to output_dir/rel_path."""
     try:
         cfg = registry_cfg or {
             "entity": args_cli.wandb_entity,
