@@ -35,10 +35,13 @@ Usage
 """Launch Isaac Sim Simulator first."""
 
 import os
+import multiprocessing as mp
 import argparse
 import numpy as np
 from pathlib import Path
 from isaaclab.app import AppLauncher
+import tempfile
+import shutil
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay motion from PHUMA (.npy/.npz) files and output to npz file.")
@@ -59,6 +62,18 @@ parser.add_argument("--recursive", action="store_true", help="Recursively walk s
 parser.add_argument("--no-recursive", dest="recursive", action="store_false", help="Do not recurse into subdirectories.")
 parser.set_defaults(recursive=False)
 parser.add_argument("--wandb_entity", type=str, default=None, help="Weights & Biases entity (user or team).")
+parser.add_argument("--upload_workers", type=int, default=4, help="Number of parallel upload workers.")
+parser.add_argument(
+    "--output_dir",
+    type=str,
+    default="/tmp/motions_phuma",
+    help="Directory to save intermediate npz files before uploading.",
+)
+parser.add_argument(
+    "--sync_from_wandb",
+    action="store_true",
+    help="At startup, cross-check wandb runs (project csv_to_npz) and sync processed_motions.txt.",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -277,6 +292,8 @@ def _run_single_motion(
     joint_names: list[str],
     motion_file: Path,
     rel_entry: str,
+    output_dir: Path,
+    out_txt: Path,
 ):
     """Runs the simulation loop for a single motion."""
 
@@ -362,41 +379,15 @@ def _run_single_motion(
             ):
                 log[k] = np.stack(log[k], axis=0)
 
-            np.savez("/tmp/motion.npz", **log)
-
-            import wandb
-
-            # Preserve subfolder information via sanitized relative path
-            COLLECTION = rel_entry.replace("/", "__").replace("\\", "__")
-            try:
-                run = wandb.init(
-                    project="csv_to_npz",
-                    name=COLLECTION,
-                    entity=args_cli.wandb_entity,
-                    reinit=True,
-                    config={
-                        "rel_path": rel_entry,
-                        "rel_dir": str(Path(rel_entry).parent.as_posix()),
-                        "filename": Path(rel_entry).name,
-                    },
-                )
-                print(f"[INFO]: Logging motion to wandb: {COLLECTION}")
-                REGISTRY = "motions"
-                logged_artifact = run.log_artifact(
-                    artifact_or_path="/tmp/motion.npz", name=COLLECTION, type=REGISTRY
-                )
-                run.link_artifact(
-                    artifact=logged_artifact, target_path=f"wandb-registry-{REGISTRY}/{COLLECTION}"
-                )
-                print(f"[INFO]: Motion saved to wandb registry: {REGISTRY}/{COLLECTION} (rel={rel_entry})")
-            except Exception as e:
-                print(f"[WARN]: Failed to log to wandb for {COLLECTION}: {e}")
-            finally:
-                try:
-                    run.finish()  # type: ignore[union-attr]
-                except Exception:
-                    pass
+            # Save to per-sample npz under output_dir preserving subfolder structure
+            target_npz = output_dir / rel_entry
+            target_npz = target_npz.with_suffix(".npz")
+            target_npz.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(target_npz.as_posix(), **log)
+            # Mark as processed immediately after local save
+            _append_with_lock(out_txt, rel_entry + "\n")
             file_saved = True
+            return target_npz
 
 
 def run_simulator(
@@ -446,23 +437,202 @@ def run_simulator(
         except Exception as e:
             print(f"[WARN]: Failed to read processed list {out_txt}: {e}")
 
+    # Optionally sync from wandb: treat wandb runs as source of truth
+    if args_cli.sync_from_wandb:
+        _sync_processed_from_wandb(out_txt, processed_rel_set, processed_stem_set, Path(args_cli.output_dir))
+
+    # Prepare multiprocessing pool for parallel uploads
+    upload_pool = mp.Pool(processes=max(1, int(args_cli.upload_workers)))
+    # Use Any type for async result to avoid type checking issues
+    pending_results: list[tuple[str, "mp.pool.ApplyResult"]] = []  # type: ignore[name-defined]
+
+    # Ensure output dir exists
+    output_dir = Path(args_cli.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     for input_file in input_files:
         rel_entry = input_file.relative_to(base_root).as_posix()
         if rel_entry in processed_rel_set or input_file.stem in processed_stem_set:
             continue
-        _run_single_motion(sim, scene, joint_names, input_file, rel_entry)
-        # Append to processed list incrementally
+        saved_npz = _run_single_motion(sim, scene, joint_names, input_file, rel_entry, output_dir, out_txt)
+        # Schedule upload task
+        if saved_npz is not None:
+            pending_results.append(
+                (
+                    rel_entry,
+                    upload_pool.apply_async(
+                        _uploader_task,
+                        args=(
+                            saved_npz.as_posix(),
+                            rel_entry,
+                            args_cli.wandb_entity,
+                        ),
+                    ),
+                )
+            )
+
+    # Close pool inputs; continue processing results
+    upload_pool.close()
+    # Collect upload results (already marked as processed on save)
+    success_count = 0
+    for rel_entry, async_res in pending_results:
+        ok = False
         try:
-            with open(out_txt, "a", encoding="utf-8") as f:
-                f.write(rel_entry + "\n")
+            ok = bool(async_res.get())
         except Exception as e:
-            print(f"[WARN]: Failed to append processed name: {e}")
+            print(f"[WARN]: Upload failed for {rel_entry}: {e}")
+        if ok:
+            success_count += 1
+    upload_pool.join()
 
     print(f"[INFO]: Saved processed list to {out_txt}")
+    print(f"[INFO]: Successfully uploaded {success_count} item(s).")
 
     print("[INFO]: All motions processed.")
     # close sim app
     simulation_app.close()
+
+
+def _uploader_task(npz_path: str, rel_entry: str, wandb_entity: str | None) -> bool:
+    """Upload a saved npz to wandb as an artifact. Runs in a worker process."""
+    try:
+        import wandb
+        collection = rel_entry.replace("/", "__").replace("\\", "__")
+        run = wandb.init(
+            project="csv_to_npz",
+            name=collection,
+            entity=wandb_entity,
+            reinit=True,
+            config={
+                "rel_path": rel_entry,
+                "rel_dir": str(Path(rel_entry).parent.as_posix()),
+                "filename": Path(rel_entry).name,
+            },
+        )
+        print(f"[INFO][upload] Logging motion to wandb: {collection}")
+        registry = "motions"
+        logged_artifact = run.log_artifact(
+            artifact_or_path=npz_path, name=collection, type=registry
+        )
+        run.link_artifact(
+            artifact=logged_artifact, target_path=f"wandb-registry-{registry}/{collection}"
+        )
+        print(f"[INFO][upload] Motion saved to wandb registry: {registry}/{collection} (rel={rel_entry})")
+        try:
+            run.finish()
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        print(f"[WARN][upload] Failed to log to wandb for {rel_entry}: {e}")
+        try:
+            run.finish()  # type: ignore[union-attr]
+        except Exception:
+            pass
+        return False
+
+
+def _append_with_lock(file_path: Path, text: str) -> None:
+    """Append a line to file with an exclusive lock (best-effort, POSIX)."""
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(file_path, "a", encoding="utf-8") as f:
+        try:
+            import fcntl  # POSIX only
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except Exception:
+            pass
+        f.write(text)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+        try:
+            import fcntl  # re-import inside scope for mypy
+            fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception:
+            pass
+
+
+def _sync_processed_from_wandb(
+    out_txt: Path, processed_rel_set: set[str], processed_stem_set: set[str], output_dir: Path
+) -> None:
+    """Sync processed list and local files from wandb runs (project 'csv_to_npz') using run.config.rel_path.
+    If an entry exists on wandb but the local output file is missing, download it to output_dir/rel_path."""
+    try:
+        import wandb
+        api = wandb.Api()
+        project_path = (
+            f"{args_cli.wandb_entity}/csv_to_npz" if args_cli.wandb_entity else "csv_to_npz"
+        )
+        runs = api.runs(project_path)
+        synced = 0
+        downloaded = 0
+        for run in runs:
+            try:
+                rel = run.config.get("rel_path", None)
+            except Exception:
+                rel = None
+            if isinstance(rel, str) and rel:
+                if rel not in processed_rel_set:
+                    _append_with_lock(out_txt, rel + "\n")
+                    processed_rel_set.add(rel)
+                    processed_stem_set.add(Path(rel).stem)
+                    synced += 1
+                # Ensure local file exists, otherwise download from artifact registry
+                target_npz = (output_dir / rel).with_suffix(".npz")
+                if not target_npz.exists():
+                    ok = _download_npz_from_wandb(rel, target_npz)
+                    if ok:
+                        downloaded += 1
+        print(f"[INFO]: Synced {synced} entries from wandb to {out_txt}")
+        print(f"[INFO]: Downloaded {downloaded} missing npz file(s) into {output_dir}")
+    except Exception as e:
+        print(f"[WARN]: Failed to sync from wandb: {e}")
+
+
+def _download_npz_from_wandb(rel_entry: str, target_npz: Path) -> bool:
+    """Download artifact for rel_entry to target_npz. Returns True on success."""
+    try:
+        import wandb
+        api = wandb.Api()
+        collection = rel_entry.replace("/", "__").replace("\\", "__")
+        # Try with entity if provided; else fall back to default resolution
+        spec_with_entity = (
+            f"{args_cli.wandb_entity}/csv_to_npz/motions/{collection}:latest"
+            if args_cli.wandb_entity
+            else None
+        )
+        candidates = []
+        if spec_with_entity:
+            candidates.append(spec_with_entity)
+        candidates.append(f"csv_to_npz/motions/{collection}:latest")
+        artifact = None
+        for spec in candidates:
+            try:
+                artifact = api.artifact(spec)
+                break
+            except Exception:
+                artifact = None
+        if artifact is None:
+            print(f"[WARN]: Artifact not found on wandb for {collection}")
+            return False
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dl_dir = Path(artifact.download(root=tmpdir))
+            # Find first .npz inside downloaded dir
+            found = None
+            for p in dl_dir.rglob("*.npz"):
+                found = p
+                break
+            if found is None:
+                print(f"[WARN]: No .npz found in artifact {collection}")
+                return False
+            target_npz.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(found.as_posix(), target_npz.as_posix())
+        return True
+    except Exception as e:
+        print(f"[WARN]: Failed to download artifact for {rel_entry}: {e}")
+        return False
 
 
 def main():
