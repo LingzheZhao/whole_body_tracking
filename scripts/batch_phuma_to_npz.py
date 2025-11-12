@@ -106,6 +106,11 @@ class WandbRegistry:
         self.entity = entity
         self.registry_project = registry_project
         self.registry_entity = registry_entity
+        # Non-prefixed canonical registry name (UI: orgs/<org>/registry/<Name>)
+        if isinstance(registry_project, str) and registry_project.startswith("wandb-registry-"):
+            self.registry_name = registry_project[len("wandb-registry-") :]
+        else:
+            self.registry_name = registry_project
         # Common project name used to create runs
         self.run_project = PROJECT_NAME
 
@@ -114,9 +119,10 @@ class WandbRegistry:
         return rel_entry.replace("/", "__").replace("\\", "__")
 
     def build_target_path(self, collection: str) -> str:
+        """Prefer linking to '<entity>/registry/<Name>/<collection>' using non-prefixed registry name."""
         if self.registry_entity:
-            return f"{self.registry_entity}/{self.registry_project}/{collection}"
-        return f"{self.registry_project}/{collection}"
+            return f"{self.registry_entity}/registry/{self.registry_name}/{collection}"
+        return f"registry/{self.registry_name}/{collection}"
 
     def candidate_run_entities(self) -> list[str | None]:
         candidates: list[str | None] = []
@@ -140,10 +146,14 @@ class WandbRegistry:
         entities = [e for e in entities if e and not (e in seen or seen.add(e))]
         specs: list[str] = []
         for ent in entities:
+            # Preferred: registry paths
+            specs.append(f"{ent}/registry/{self.registry_name}/{collection}:latest")
+            # Back-compat: direct project names
             specs.append(f"{ent}/{self.registry_project}/{collection}:latest")
             specs.append(f"{ent}/wandb-registry-Motions/{collection}:latest")
             specs.append(f"{ent}/wandb-registry-motions/{collection}:latest")
             specs.append(f"{ent}/{fallback_project}/{collection}:latest")
+        specs.append(f"registry/{self.registry_name}/{collection}:latest")
         specs.append(f"{self.registry_project}/{collection}:latest")
         specs.append(f"wandb-registry-Motions/{collection}:latest")
         specs.append(f"wandb-registry-motions/{collection}:latest")
@@ -155,6 +165,7 @@ class WandbRegistry:
             "entity": self.entity,
             "registry_project": self.registry_project,
             "registry_entity": self.registry_entity,
+            "registry_name": self.registry_name,
             "run_project": self.run_project,
         }
 
@@ -175,7 +186,7 @@ class WandbRegistry:
         # choose run entity
         entity = cfg.get("entity")
         registry_entity = cfg.get("registry_entity")
-        registry_project = cfg.get("registry_project")
+        registry_name = cfg.get("registry_name", cfg.get("registry_project"))
         run_project = cfg.get("run_project", PROJECT_NAME)
         candidate_run_entities: list[str | None] = []
         if entity:
@@ -207,11 +218,11 @@ class WandbRegistry:
             return False
         print(f"[INFO][upload] Logging motion to wandb: {collection}")
         logged_artifact = run.log_artifact(artifact_or_path=npz_path, name=collection, type="motions")
-        # target path
+        # target path: prefer registry path with non-prefixed name
         if registry_entity:
-            target_path = f"{registry_entity}/{registry_project}/{collection}"
+            target_path = f"{registry_entity}/registry/{registry_name}/{collection}"
         else:
-            target_path = f"{registry_project}/{collection}"
+            target_path = f"registry/{registry_name}/{collection}"
         run.link_artifact(artifact=logged_artifact, target_path=target_path)
         print(f"[INFO][upload] Motion saved to wandb registry: {target_path} (rel={rel_entry})")
         try:
@@ -226,6 +237,7 @@ class WandbRegistry:
         api = wandb.Api()
         collection = rel_entry.replace("/", "__").replace("\\", "__")
         registry_project = cfg.get("registry_project")
+        registry_name = cfg.get("registry_name", registry_project)
         entity = cfg.get("entity")
         registry_entity = cfg.get("registry_entity")
         run_project = cfg.get("run_project", PROJECT_NAME)
@@ -240,10 +252,12 @@ class WandbRegistry:
         probe_entities = [e for e in probe_entities if e and not (e in seen or seen.add(e))]
         candidates: list[str] = []
         for ent in probe_entities:
+            candidates.append(f"{ent}/registry/{registry_name}/{collection}:latest")
             candidates.append(f"{ent}/{registry_project}/{collection}:latest")
             candidates.append(f"{ent}/wandb-registry-Motions/{collection}:latest")
             candidates.append(f"{ent}/wandb-registry-motions/{collection}:latest")
             candidates.append(f"{ent}/{run_project}/{collection}:latest")
+        candidates.append(f"registry/{registry_name}/{collection}:latest")
         candidates.append(f"{registry_project}/{collection}:latest")
         candidates.append(f"wandb-registry-Motions/{collection}:latest")
         candidates.append(f"wandb-registry-motions/{collection}:latest")
@@ -314,38 +328,80 @@ class WandbRegistry:
         import wandb
         api = wandb.Api()
         print("[INFO]: Syncing from WandB registry (collections) ...")
-        # Resolve a registry artifact type first
+        print(f"[INFO]: cfg: {cfg}")
+        # Try registries API first
         registry_project = cfg.get("registry_project")
+        registry_name = cfg.get("registry_name", registry_project)
         entity = cfg.get("entity")
         registry_entity = cfg.get("registry_entity")
-        # candidates for project path to fetch artifact type
+        # 1) registries API
+        collections = WandbRegistry._try_list_collections_via_registries(api, registry_name, registry_entity)
+        if collections is not None:
+            WandbRegistry._process_collections_parallel(collections, out_txt, processed_rel_set, processed_stem_set, output_dir, cfg)
+            return
+        # 2) artifact_type probing fallback
+        collections = WandbRegistry._try_list_collections_via_artifact_type(api, entity, registry_entity, registry_project, registry_name)
+        if collections is not None:
+            WandbRegistry._process_collections_parallel(collections, out_txt, processed_rel_set, processed_stem_set, output_dir, cfg)
+            return
+        # 3) runs fallback
+        WandbRegistry._fallback_sync_via_runs(api, out_txt, processed_rel_set, processed_stem_set, output_dir, cfg)
+
+    @staticmethod
+    def _try_list_collections_via_registries(api, registry_name: str | None, registry_entity: str | None):
+        try:
+            regs = api.registries(filter={"name": registry_name}) if registry_name else api.registries()
+            reg_obj = None
+            for r in regs:
+                try:
+                    ent = getattr(r, "entity", None) or getattr(r, "organization_name", None)
+                except Exception:
+                    ent = None
+                if registry_entity is None or ent == registry_entity:
+                    reg_obj = r
+                    break
+            if reg_obj is not None:
+                cols = list(reg_obj.collections())
+                print(f"[INFO]: Found {len(cols)} collections in {getattr(reg_obj, 'name', registry_name)} (registries API)")
+                return cols
+        except Exception as e:
+            print(f"[WARN]: registries API unavailable: {e}")
+        return None
+
+    @staticmethod
+    def _try_list_collections_via_artifact_type(api, entity: str | None, registry_entity: str | None, registry_project: str | None, registry_name: str | None):
         proj_candidates: list[str] = []
-        if registry_entity:
-            proj_candidates.append(f"{registry_entity}/{registry_project}")
-        if entity:
-            proj_candidates.append(f"{entity}/{registry_project}")
-            proj_candidates.append(f"{entity}-org/{registry_project}")
+        if registry_entity and registry_name:
+            proj_candidates.append(f"{registry_entity}/registry/{registry_name}")
+            if registry_project:
+                proj_candidates.append(f"{registry_entity}/{registry_project}")
+        if entity and registry_name:
+            proj_candidates.append(f"{entity}/registry/{registry_name}")
+            proj_candidates.append(f"{entity}-org/registry/{registry_name}")
+            if registry_project:
+                proj_candidates.append(f"{entity}/{registry_project}")
+                proj_candidates.append(f"{entity}-org/{registry_project}")
+        if registry_name:
+            proj_candidates.append(f"registry/{registry_name}")
         if registry_project:
-            proj_candidates.append(registry_project)  # no entity fallback
-        art_type = None
+            proj_candidates.append(registry_project)
         last_err: Exception | None = None
-        last_project_path = None
         for proj in proj_candidates:
             try:
                 art_type = api.artifact_type(proj, REGISTRY_NAME)
-                last_project_path = proj
-                break
+                cols = list(art_type.collections())
+                print(f"[INFO]: Found {len(cols)} collections in {proj} (type={REGISTRY_NAME})")
+                return cols
             except Exception as e:
                 last_err = e
                 continue
-        if art_type is None:
-            raise RuntimeError(f"Could not locate artifact type '{REGISTRY_NAME}' under candidates: {proj_candidates}. "
-                               f"Last error: {last_err}")
-        # iterate collections (one per encoded relative path)
-        collections = list(art_type.collections())
-        print(f"[INFO]: Found {len(collections)} collections in {last_project_path} (type={REGISTRY_NAME})")
+        print(f"[WARN]: Registry not found via artifact_type (candidates={proj_candidates}). Last error: {last_err}")
+        return None
+
+    @staticmethod
+    def _process_collections_parallel(collections, out_txt: Path, processed_rel_set: set[str], processed_stem_set: set[str], output_dir: Path, cfg: dict) -> None:
         synced = 0
-        downloaded = 0
+        to_download: list[tuple[str, Path]] = []
         for coll in collections:
             try:
                 encoded_name = coll.name
@@ -359,10 +415,98 @@ class WandbRegistry:
                 synced += 1
             target_npz = (output_dir / rel).with_suffix(".npz")
             if not target_npz.exists():
-                if WandbRegistry.download_with_cfg(rel, target_npz, cfg):
+                to_download.append((rel, target_npz))
+        downloaded = 0
+        if to_download:
+            import multiprocessing as _mp
+            pool = _mp.Pool(processes=max(1, int(getattr(args_cli, "sync_workers", 8))))
+            results = [
+                pool.apply_async(WandbRegistry.download_with_cfg, args=(rel, dst, cfg))
+                for rel, dst in to_download
+            ]
+            pool.close()
+            for rel, res in zip((r for r, _ in to_download), results):
+                ok = False
+                try:
+                    ok = bool(res.get())
+                except Exception:
+                    ok = False
+                if ok:
                     downloaded += 1
+            pool.join()
         print(f"[INFO]: Synced {synced} entries from wandb to {out_txt}")
         print(f"[INFO]: Downloaded {downloaded} missing npz file(s) into {output_dir}")
+
+    @staticmethod
+    def _fallback_sync_via_runs(api, out_txt: Path, processed_rel_set: set[str], processed_stem_set: set[str], output_dir: Path, cfg: dict) -> None:
+        run_project = cfg.get("run_project", PROJECT_NAME)
+        entity = cfg.get("entity")
+        registry_entity = cfg.get("registry_entity")
+        run_proj_candidates: list[str] = []
+        probe_entities: list[str] = []
+        if entity:
+            probe_entities.append(entity)
+            probe_entities.append(f"{entity}-org")
+        if registry_entity:
+            probe_entities.append(registry_entity)
+        _seen = set()
+        probe_entities = [e for e in probe_entities if e and not (e in _seen or _seen.add(e))]
+        for ent in probe_entities:
+            run_proj_candidates.append(f"{ent}/{run_project}")
+        run_proj_candidates.append(run_project)
+        runs = []
+        last_run_err: Exception | None = None
+        last_run_project = None
+        for proj in run_proj_candidates:
+            try:
+                runs = api.runs(proj)
+                last_run_project = proj
+                break
+            except Exception as e:
+                last_run_err = e
+                continue
+        if not runs:
+            raise RuntimeError(
+                f"Could not sync from registry nor runs. Tried runs={run_proj_candidates}. "
+                f"Last error: {last_run_err}"
+            )
+        print(f"[INFO]: Found {len(runs)} runs in {last_run_project}")
+        _synced = 0
+        to_download: list[tuple[str, Path]] = []
+        for run in runs:
+            try:
+                rel = run.config.get("rel_path", None)
+            except Exception:
+                rel = None
+            if isinstance(rel, str) and rel:
+                if rel not in processed_rel_set:
+                    _append_with_lock(out_txt, rel + "\n")
+                    processed_rel_set.add(rel)
+                    processed_stem_set.add(Path(rel).stem)
+                    _synced += 1
+                target_npz = (output_dir / rel).with_suffix(".npz")
+                if not target_npz.exists():
+                    to_download.append((rel, target_npz))
+        _downloaded = 0
+        if to_download:
+            import multiprocessing as _mp
+            pool = _mp.Pool(processes=max(1, int(getattr(args_cli, "sync_workers", 8))))
+            results = [
+                pool.apply_async(WandbRegistry.download_with_cfg, args=(rel, dst, cfg))
+                for rel, dst in to_download
+            ]
+            pool.close()
+            for rel, res in zip((r for r, _ in to_download), results):
+                ok = False
+                try:
+                    ok = bool(res.get())
+                except Exception:
+                    ok = False
+                if ok:
+                    _downloaded += 1
+            pool.join()
+        print(f"[INFO]: Synced {_synced} entries from wandb runs to {out_txt}")
+        print(f"[INFO]: Downloaded {_downloaded} missing npz file(s) into {output_dir}")
 
 
 class MotionExporter:
@@ -548,6 +692,12 @@ parser.add_argument(
     type=str,
     default="missing_in_wandb.txt",
     help="Filename to write motions not found in WandB registry (relative to input root). Default: missing_in_wandb.txt",
+)
+parser.add_argument(
+    "--sync_workers",
+    type=int,
+    default=8,
+    help="Number of parallel workers to download missing files during sync.",
 )
 parser.add_argument(
     "--no-verify-uploaded",
