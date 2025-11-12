@@ -329,6 +329,7 @@ class WandbRegistry:
         api = wandb.Api()
         print("[INFO]: Syncing from WandB registry (collections) ...")
         print(f"[INFO]: cfg: {cfg}")
+        print(f"[INFO]: Trying to list collections via registries API, this may take a few minutes...")
         # Try registries API first
         registry_project = cfg.get("registry_project")
         registry_name = cfg.get("registry_name", registry_project)
@@ -402,7 +403,14 @@ class WandbRegistry:
     def _process_collections_parallel(collections, out_txt: Path, processed_rel_set: set[str], processed_stem_set: set[str], output_dir: Path, cfg: dict) -> None:
         synced = 0
         to_download: list[tuple[str, Path]] = []
-        for coll in collections:
+        # progress for enumerating collections
+        total_cols = None
+        try:
+            total_cols = len(collections)  # collections could be list already
+        except Exception:
+            total_cols = None
+        print(f"[INFO]: Processing {total_cols} collections")
+        for coll in _progress_iter(collections, total=total_cols, desc="Sync (collections)"):
             try:
                 encoded_name = coll.name
                 rel = encoded_name.replace("__", "/")
@@ -425,7 +433,9 @@ class WandbRegistry:
                 for rel, dst in to_download
             ]
             pool.close()
-            for rel, res in zip((r for r, _ in to_download), results):
+            # progress for downloads
+            print(f"[INFO]: Downloading {len(results)} npz file(s)")
+            for (rel, _), res in _progress_iter(list(zip(to_download, results)), total=len(results), desc="Sync (registry download)"):
                 ok = False
                 try:
                     ok = bool(res.get())
@@ -473,7 +483,7 @@ class WandbRegistry:
         print(f"[INFO]: Found {len(runs)} runs in {last_run_project}")
         _synced = 0
         to_download: list[tuple[str, Path]] = []
-        for run in runs:
+        for run in _progress_iter(runs, total=len(runs), desc="Sync (runs enumerate)"):
             try:
                 rel = run.config.get("rel_path", None)
             except Exception:
@@ -496,7 +506,7 @@ class WandbRegistry:
                 for rel, dst in to_download
             ]
             pool.close()
-            for rel, res in zip((r for r, _ in to_download), results):
+            for (rel, _), res in _progress_iter(list(zip(to_download, results)), total=len(results), desc="Sync (runs download)"):
                 ok = False
                 try:
                     ok = bool(res.get())
@@ -578,9 +588,19 @@ class BatchPhumaProcessor:
         if self.args.verify_uploaded:
             cfg = self.wandb.serialize()
             missing: list[str] = []
-            for rel in sorted(self.processed.processed_rel_set):
-                if not WandbRegistry.artifact_exists_with_cfg(rel, cfg):
-                    missing.append(rel)
+            rels_sorted = sorted(self.processed.processed_rel_set)
+            if len(rels_sorted) > 0:
+                pool = mp.Pool(processes=max(1, int(getattr(args_cli, "sync_workers", 8))))
+                results = [pool.apply_async(_verify_exists_task, args=(rel, cfg)) for rel in rels_sorted]
+                pool.close()
+                for res in _progress_iter(results, total=len(results), desc="Verifying on WandB"):
+                    try:
+                        rel, ok = res.get()
+                    except Exception:
+                        rel, ok = ("", False)
+                    if rel and not ok:
+                        missing.append(rel)
+                pool.join()
             missing_path = (self.processed.path.parent / self.args.missing_list_name)
             try:
                 with open(missing_path, "w", encoding="utf-8") as f:
@@ -604,6 +624,9 @@ class BatchPhumaProcessor:
         pool.close()
         uploaded = 0
         for rel, res in pending:
+            break
+        # Progress bar for uploads
+        for rel, res in _progress_iter(pending, total=len(pending), desc="Uploading to WandB"):
             ok = False
             try:
                 ok = bool(res.get())
@@ -624,6 +647,30 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 import tempfile
 import shutil
+import os as _os
+
+# Suppress W&B console noise
+_os.environ.setdefault("WANDB_SILENT", "true")  # set to true to suppress wandb console output
+# Suppress W&B console noise (valid values for WANDB_CONSOLE: auto/off/wrap/redirect/wrap_raw/wrap_emu)
+_os.environ.setdefault("WANDB_CONSOLE", "off")
+
+
+try:
+    from tqdm import tqdm as _tqdm  # type: ignore
+except Exception:
+    _tqdm = None
+
+
+def _progress_iter(iterable, total: int | None = None, desc: str | None = None):
+    if _tqdm is None:
+        return iterable
+    kwargs = {}
+    if total is not None:
+        kwargs["total"] = total
+    if desc is not None:
+        kwargs["desc"] = desc
+    return _tqdm(iterable, **kwargs)
+
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay motion from PHUMA (.npy/.npz) files and output to npz file.")
@@ -1043,6 +1090,15 @@ def _uploader_task(npz_path: str, rel_entry: str, registry_cfg: dict) -> bool:
         return False
 
 
+def _verify_exists_task(rel_entry: str, registry_cfg: dict) -> tuple[str, bool]:
+    """Worker task: check if an artifact exists for rel_entry in WandB registry."""
+    try:
+        ok = WandbRegistry.artifact_exists_with_cfg(rel_entry, registry_cfg)
+        return rel_entry, bool(ok)
+    except Exception:
+        return rel_entry, False
+
+
 def _append_with_lock(file_path: Path, text: str) -> None:
     """Append a line to file with an exclusive lock (best-effort, POSIX)."""
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1080,21 +1136,6 @@ def _sync_processed_from_wandb(
         return WandbRegistry.sync_runs_with_cfg(out_txt, processed_rel_set, processed_stem_set, output_dir, cfg)
     except Exception as e:
         print(f"[WARN]: Failed to sync from wandb: {e}")
-
-
-def _download_npz_from_wandb(rel_entry: str, target_npz: Path) -> bool:
-    """Download artifact for rel_entry to target_npz. Returns True on success."""
-    try:
-        cfg = {
-            "entity": args_cli.wandb_entity,
-            "registry_entity": args_cli.wandb_registry_entity,
-            "registry_project": args_cli.wandb_registry_project,
-            "run_project": PROJECT_NAME,
-        }
-        return WandbRegistry.download_with_cfg(rel_entry, target_npz, cfg)
-    except Exception as e:
-        print(f"[WARN]: Failed to download artifact for {rel_entry}: {e}")
-        return False
 
 
 def main():
