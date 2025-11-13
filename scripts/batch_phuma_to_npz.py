@@ -4,8 +4,19 @@ Overview
 - Discovers input files (.npy/.npz) in a directory (optionally recursive) or a single file.
 - Replays motion in Isaac/IsaacLab to export per-sample npz preserving relative folder structure.
 - Uploads exported npz artifacts to a WandB registry project and links them there.
-- Maintains resumable progress via processed_motions.txt (relative paths, one per line).
-- Supports startup synchronization with WandB to hydrate processed list and download missing npz.
+- Supports Wandb entity vs organization handling by using a non-prefixed canonical registry name.
+- Supports saving exported npz files under '--output_dir' mirroring input structure.
+- Supports parallelism by increasing '--upload_workers', '--sync_workers' to alleviate network bottlenecks.
+- Automatically sanitize input file names from special characters.
+
+Resumable Processing
+- processed_motions.txt records relative paths (with extensions). On restart, those entries are skipped.
+- Entries are appended immediately after local save to reflect real-time progress.
+- File writes use a best-effort POSIX lock to reduce risk of corruption under multi-process/multi-instance writes.
+- Supports startup synchronization with WandB to hydrate processed list and download locally-missing npz.
+- Supports verification of uploaded entries against WandB registry (writes a remotely-missing list).
+- Final check of any missing entries against the input dataset and re-process them.
+
 
 Key Arguments
 - --input_dir: File or directory containing PHUMA .npy/.npz.
@@ -24,6 +35,8 @@ WandB Settings
       '<wandb_registry_entity>/<wandb_registry_project>/<encoded_rel_name>'
     If --wandb_registry_entity is not provided, falls back to '<wandb_registry_project>/<encoded_rel_name>'.
   - Encoded name preserves folders by replacing '/' with '__'.
+
+WandB Synchronization (disabled by default)
 - --sync_from_wandb:
   - On startup, sync from WandB REGISTRY (artifact collections), not from runs:
     - Append any missing rel_path (decoded from collection names) into processed_motions.txt
@@ -34,9 +47,9 @@ WandB Settings
     '{wandb_entity}/{registry_project}/{name}:latest',
     and case variants, plus fallback to the run project if needed.
 
-Verification (enabled by default)
-- --verify_uploaded / --no-verify-uploaded:
-  - If enabled (default), the script checks all entries in processed_motions.txt against the WandB registry.
+WandB Verification (disabled by default)
+- --verify_uploaded:
+  - If enabled, the script checks all entries in processed_motions.txt against the WandB registry.
   - Missing entries are written to '--missing_list_name' in the input root.
 - --missing_list_name:
   - Name of the report file for missing entries. Default: 'missing_in_wandb.txt'.
@@ -64,7 +77,7 @@ from __future__ import annotations
 
 
 PROJECT_NAME = "csv_to_npz"
-REGISTRY_NAME = "motions"
+REGISTRY_NAME = "Motions"
 
 
 class ProcessedListManager:
@@ -83,20 +96,59 @@ class ProcessedListManager:
                     for line in f:
                         entry = line.strip()
                         if entry:
-                            self.processed_rel_set.add(entry)
-                            self.processed_stem_set.add(Path(entry).stem)
+                            sanitized = sanitize_rel_path(entry)
+                            if sanitized != entry:
+                                print(f"[WARN]: Sanitized entry from processed list: {entry} -> {sanitized}")
+                            self.processed_rel_set.add(sanitized)
+                            self.processed_stem_set.add(Path(sanitized).stem)
                 print(f"[INFO]: Loaded {len(self.processed_rel_set)} processed entries from {self.path}")
             except Exception as e:
                 print(f"[WARN]: Failed to read processed list {self.path}: {e}")
 
     def append(self, rel_entry: str) -> None:
-        if rel_entry not in self.processed_rel_set:
-            _append_with_lock(self.path, rel_entry + "\n")
-            self.processed_rel_set.add(rel_entry)
-            self.processed_stem_set.add(Path(rel_entry).stem)
+        sanitized = sanitize_rel_path(rel_entry)
+        if sanitized not in self.processed_rel_set:
+            _append_with_lock(self.path, sanitized + "\n")
+            self.processed_rel_set.add(sanitized)
+            self.processed_stem_set.add(Path(sanitized).stem)
 
     def contains(self, rel_entry: str) -> bool:
-        return rel_entry in self.processed_rel_set or Path(rel_entry).stem in self.processed_stem_set
+        sanitized = sanitize_rel_path(rel_entry)
+        return sanitized in self.processed_rel_set or Path(sanitized).stem in self.processed_stem_set
+
+    def remove(self, rel_entry: str) -> None:
+        """Remove an entry from processed list (both file and in-memory sets)."""
+        sanitized = sanitize_rel_path(rel_entry)
+        if sanitized in self.processed_rel_set:
+            try:
+                _rewrite_excluding_with_lock(self.path, {sanitized})
+            except Exception as e:
+                print(f"[WARN]: Failed to rewrite processed list when removing {sanitized}: {e}")
+            self.processed_rel_set.discard(sanitized)
+            self.processed_stem_set.discard(Path(sanitized).stem)
+
+    def backup_and_remove(self, rels_to_remove: set[str]) -> Path | None:
+        """Backup current processed list and write a new one with given entries removed.
+        Returns backup file path if backup created, else None."""
+        if not self.path.exists() or not rels_to_remove:
+            return None
+        try:
+            from datetime import datetime as _dt
+            ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = self.path.with_name(f"{self.path.stem}.bak.{ts}{self.path.suffix}")
+            self.path.rename(backup_path)
+            remaining = [rel for rel in sorted(self.processed_rel_set) if rel not in rels_to_remove]
+            with open(self.path, "w", encoding="utf-8") as f:
+                for rel in remaining:
+                    f.write(rel + "\n")
+            # refresh in-memory sets
+            self.processed_rel_set = set(remaining)
+            self.processed_stem_set = {Path(r).stem for r in remaining}
+            print(f"[INFO]: Backed up processed list to {backup_path} and removed {len(rels_to_remove)} entries.")
+            return backup_path
+        except Exception as e:
+            print(f"[WARN]: Failed to backup/remove processed list entries: {e}")
+            return None
 
 
 class WandbRegistry:
@@ -218,13 +270,30 @@ class WandbRegistry:
             return False
         print(f"[INFO][upload] Logging motion to wandb: {collection}")
         logged_artifact = run.log_artifact(artifact_or_path=npz_path, name=collection, type="motions")
-        # target path: prefer registry path with non-prefixed name
-        if registry_entity:
-            target_path = f"{registry_entity}/registry/{registry_name}/{collection}"
-        else:
-            target_path = f"registry/{registry_name}/{collection}"
-        run.link_artifact(artifact=logged_artifact, target_path=target_path)
-        print(f"[INFO][upload] Motion saved to wandb registry: {target_path} (rel={rel_entry})")
+        # Link artifact into registry collection via artifact_type(...).collection(...).link_artifact(...)
+        try:
+            import wandb  # local import to avoid worker import cycles
+            api = wandb.Api()
+            registry_proj_path = f"{registry_entity}/registry/{registry_name}" if registry_entity else f"registry/{registry_name}"
+            art_type = api.artifact_type(registry_proj_path, REGISTRY_NAME)
+            coll = art_type.collection(collection)
+            link_method = getattr(coll, "link_artifact", None)
+            if not callable(link_method):
+                raise RuntimeError("ArtifactCollection.link_artifact is unavailable in this wandb version")
+            link_method(logged_artifact)  # type: ignore[misc]
+            print(f"[INFO][upload] Motion linked via collection.link_artifact: {registry_proj_path}/{collection}")
+        except Exception as e1:
+            # Fallback to linking into a normal project bucket path to avoid registry path validation
+            try:
+                target_bucket_path = (
+                    f"{registry_entity}/{cfg.get('registry_project', registry_name)}/{collection}"
+                    if registry_entity
+                    else f"{cfg.get('registry_project', registry_name)}/{collection}"
+                )
+                logged_artifact.link(target_bucket_path)
+                print(f"[INFO][upload] Motion linked via artifact.link to bucket: {target_bucket_path}")
+            except Exception as e2:  # noqa: BLE001
+                print(f"[WARN][upload] Failed to link artifact into registry/bucket. collection.link_artifact error={e1}; artifact.link error={e2}")
         try:
             run.finish()
         except Exception:
@@ -322,6 +391,76 @@ class WandbRegistry:
         return False
 
     @staticmethod
+    def list_all_rel_entries_with_cfg(cfg: dict) -> set[str]:
+        """Return a set of rel_path strings for all motions available in the WandB registry or fallback sources.
+        Prefers the Registries API; falls back to artifact_type; finally falls back to runs config 'rel_path'."""
+        import wandb
+        api = wandb.Api()
+        registry_project = cfg.get("registry_project")
+        registry_name = cfg.get("registry_name", registry_project)
+        entity = cfg.get("entity")
+        registry_entity = cfg.get("registry_entity")
+        run_project = cfg.get("run_project", PROJECT_NAME)
+        # 1) registries API
+        cols = WandbRegistry._try_list_collections_via_registries(api, registry_name, registry_entity)
+        if cols is not None:
+            rels: set[str] = set()
+            try:
+                total_cols = len(cols)
+            except Exception:
+                total_cols = None
+            for coll in _progress_iter(cols, total=total_cols, desc="Enumerate registry (collections)"):
+                try:
+                    rels.add(coll.name.replace("__", "/"))
+                except Exception:
+                    continue
+            return rels
+        # 2) artifact_type fallback
+        cols = WandbRegistry._try_list_collections_via_artifact_type(api, entity, registry_entity, registry_project, registry_name)
+        if cols is not None:
+            rels = set()
+            try:
+                total_cols = len(cols)
+            except Exception:
+                total_cols = None
+            for coll in _progress_iter(cols, total=total_cols, desc="Enumerate artifact_type (collections)"):
+                try:
+                    rels.add(coll.name.replace("__", "/"))
+                except Exception:
+                    continue
+            return rels
+        # 3) runs fallback
+        run_proj_candidates: list[str] = []
+        probe_entities: list[str] = []
+        if entity:
+            probe_entities.append(entity)
+            probe_entities.append(f"{entity}-org")
+        if registry_entity:
+            probe_entities.append(registry_entity)
+        _seen = set()
+        probe_entities = [e for e in probe_entities if e and not (e in _seen or _seen.add(e))]
+        for ent in probe_entities:
+            run_proj_candidates.append(f"{ent}/{run_project}")
+        run_proj_candidates.append(run_project)
+        runs = []
+        for proj in run_proj_candidates:
+            try:
+                runs = api.runs(proj)
+                break
+            except Exception:
+                continue
+        rels = set()
+        if runs:
+            for run in _progress_iter(runs, total=len(runs), desc="Enumerate runs (fallback)"):
+                try:
+                    rel = run.config.get("rel_path", None)
+                except Exception:
+                    rel = None
+                if isinstance(rel, str) and rel:
+                    rels.add(rel)
+        return rels
+
+    @staticmethod
     def sync_runs_with_cfg(
         out_txt: Path, processed_rel_set: set[str], processed_stem_set: set[str], output_dir: Path, cfg: dict
     ) -> None:
@@ -329,7 +468,7 @@ class WandbRegistry:
         api = wandb.Api()
         print("[INFO]: Syncing from WandB registry (collections) ...")
         print(f"[INFO]: cfg: {cfg}")
-        print(f"[INFO]: Trying to list collections via registries API, this may take a few minutes...")
+        print("[INFO]: Trying to list collections via registries API, this may take a few minutes...")
         # Try registries API first
         registry_project = cfg.get("registry_project")
         registry_name = cfg.get("registry_name", registry_project)
@@ -559,61 +698,74 @@ class BatchPhumaProcessor:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.processed = ProcessedListManager(self.input_dir)
         self.wandb = WandbRegistry(args.wandb_entity, args.wandb_registry_project, args.wandb_registry_entity)
+        # Read-only backup of all input motions' relative paths, populated in discover_inputs()
+        self._all_inputs_rel: list[str] = []
 
-    def discover_inputs(self) -> list[Path]:
-        files: list[Path] = []
-        if self.input_dir.is_file():
-            assert self.input_dir.suffix.lower() in {".npy", ".npz"}
-            files.append(self.input_dir)
-        else:
-            if self.args.recursive:
-                for root, _, fnames in os.walk(self.input_dir):
-                    root_path = Path(root)
-                    for fn in fnames:
-                        if fn.endswith(".npy") or fn.endswith(".npz"):
-                            files.append(root_path / fn)
-            else:
-                for fn in os.listdir(self.input_dir):
-                    if fn.endswith(".npy") or fn.endswith(".npz"):
-                        files.append(self.input_dir / fn)
-        files = sorted(files)
-        assert len(files) > 0, f"No .npy/.npz files found in {self.input_dir}"
-        print(f"[INFO]: Found {len(files)} PHUMA file(s) in {self.input_dir} (recursive={self.args.recursive})")
-        return files
+    def _rename_if_needed(self, p: Path) -> Path:
+        """Rename the given file if its basename contains disallowed characters or '__' sequence."""
+        if not p.exists() or not p.is_file():
+            return p
+        sanitized_name = _sanitize_basename(p.name)
+        # avoid '__' by collapsing underscores already done in _sanitize_basename
+        if sanitized_name == p.name:
+            return p
+        target = p.with_name(sanitized_name)
+        # Avoid collision by adding numeric suffix if needed
+        if target.exists():
+            stem, suffix = target.stem, target.suffix
+            k = 1
+            while target.exists():
+                candidate = p.with_name(f"{stem}-{k}{suffix}")
+                target = candidate
+                k += 1
+        try:
+            p.rename(target)
+            print(f"[INFO]: Renamed input file: {p.name} -> {target.name}")
+            return target
+        except Exception as e:
+            print(f"[WARN]: Failed to rename {p.name}: {e}. Proceeding with original name.")
+            return p
 
-    def run(self, sim: sim_utils.SimulationContext, scene: InteractiveScene, joint_names: list[str]) -> None:
-        self.processed.load()
-        if self.args.sync_from_wandb:
-            self.wandb.sync(self.processed, self.output_dir)
-        if self.args.verify_uploaded:
-            cfg = self.wandb.serialize()
-            missing: list[str] = []
-            rels_sorted = sorted(self.processed.processed_rel_set)
-            if len(rels_sorted) > 0:
-                pool = mp.Pool(processes=max(1, int(getattr(args_cli, "sync_workers", 8))))
-                results = [pool.apply_async(_verify_exists_task, args=(rel, cfg)) for rel in rels_sorted]
-                pool.close()
-                for res in _progress_iter(results, total=len(results), desc="Verifying on WandB"):
-                    try:
-                        rel, ok = res.get()
-                    except Exception:
-                        rel, ok = ("", False)
-                    if rel and not ok:
-                        missing.append(rel)
-                pool.join()
-            missing_path = (self.processed.path.parent / self.args.missing_list_name)
-            try:
-                with open(missing_path, "w", encoding="utf-8") as f:
-                    for rel in missing:
-                        f.write(rel + "\n")
-                print(f"[INFO]: Verified processed entries. Missing in WandB: {len(missing)}. Saved to {missing_path}")
-            except Exception as e:
-                print(f"[WARN]: Failed to write missing list: {e}")
-        exporter = MotionExporter(sim, scene, joint_names, self.output_dir, self.processed)
-        files = self.discover_inputs()
+    def _compute_missing_and_update(self) -> set[str]:
+        missing_set: set[str] = set()
+        if not self.args.verify_uploaded:
+            return missing_set
+        cfg = self.wandb.serialize()
+        print(f"[INFO]: Verifying uploaded entries against WandB registry (cfg={cfg})")
+        available_rels = WandbRegistry.list_all_rel_entries_with_cfg(cfg)
+        rels_sorted = sorted(self.processed.processed_rel_set)
+        missing: list[str] = []
+        for rel in _progress_iter(rels_sorted, total=len(rels_sorted), desc="Compare with registry"):
+            if rel not in available_rels:
+                missing.append(rel)
+        missing_path = (self.processed.path.parent / self.args.missing_list_name)
+        try:
+            with open(missing_path, "w", encoding="utf-8") as f:
+                for rel in missing:
+                    f.write(rel + "\n")
+            print(f"[INFO]: Verified processed entries. Missing in WandB: {len(missing)}. Saved to {missing_path}")
+        except Exception as e:
+            print(f"[WARN]: Failed to write missing list: {e}")
+        if missing:
+            self.processed.backup_and_remove(set(missing))
+            missing_set = set(missing)
+        return missing_set
 
-        pool = mp.Pool(processes=max(1, int(self.args.upload_workers)))
-        pending: list[tuple[str, "mp.pool.ApplyResult"]] = []  # type: ignore[name-defined]
+    def _prioritize_files(self, files: list[Path], missing_set: set[str]) -> list[Path]:
+        if not missing_set:
+            return files
+
+        def _priority_key(p: Path) -> tuple[int, str]:
+            rel = p.relative_to(self.base_root).as_posix()
+            return (0 if rel in missing_set else 1, rel)
+
+        print(f"[INFO]: Prioritizing {len(files)}")
+        return sorted(files, key=_priority_key)
+
+    def _process_and_upload(self, exporter: "MotionExporter", files: list[Path], desc: str = "Uploading to WandB") -> int:
+        import multiprocessing as _mp  # avoid early import issues
+        pool = _mp.Pool(processes=max(1, int(self.args.upload_workers)))
+        pending: list[tuple[str, "_mp.pool.ApplyResult"]] = []  # type: ignore[name-defined]
         for f in files:
             rel = f.relative_to(self.base_root).as_posix()
             if self.processed.contains(rel):
@@ -623,10 +775,9 @@ class BatchPhumaProcessor:
                 pending.append((rel, self.wandb.upload_async(pool, saved, rel)))
         pool.close()
         uploaded = 0
-        for rel, res in pending:
+        for _rel, _res in pending:
             break
-        # Progress bar for uploads
-        for rel, res in _progress_iter(pending, total=len(pending), desc="Uploading to WandB"):
+        for rel, res in _progress_iter(pending, total=len(pending), desc=desc):
             ok = False
             try:
                 ok = bool(res.get())
@@ -634,9 +785,94 @@ class BatchPhumaProcessor:
                 print(f"[WARN]: Upload failed for {rel}: {e}")
             if ok:
                 uploaded += 1
+            else:
+                # Roll back processed list entry if upload failed
+                try:
+                    self.processed.remove(rel)
+                except Exception as _e:
+                    print(f"[WARN]: Failed to roll back processed entry {rel}: {_e}")
         pool.join()
+        return uploaded
+
+    def _final_verify_and_reprocess(self, exporter: "MotionExporter") -> None:
+        if not self.args.verify_uploaded:
+            return
+        cfg = self.wandb.serialize()
+        available_rels = WandbRegistry.list_all_rel_entries_with_cfg(cfg)
+        # Use the full list of motions discovered from the input dataset
+        rels_full = list(self._all_inputs_rel) if isinstance(self._all_inputs_rel, list) else []
+        if not rels_full:
+            # Fallback to processed set if full list is unavailable
+            rels_full = list(self.processed.processed_rel_set)
+        rels_sorted = sorted(rels_full)
+        final_missing: list[str] = []
+        for rel in _progress_iter(rels_sorted, total=len(rels_sorted), desc="Final compare with registry"):
+            if rel not in available_rels:
+                final_missing.append(rel)
+        if not final_missing:
+            return
+        print(f"[INFO]: Final pass: {len(final_missing)} motion(s) still missing on WandB. Re-processing now...")
+        files: list[Path] = []
+        for rel in final_missing:
+            src = (self.base_root / rel)
+            if src.exists():
+                files.append(src)
+        if not files:
+            print("[WARN]: Final pass: no source files present for missing motions.")
+            return
+        uploaded2 = self._process_and_upload(exporter, files, desc="Uploading (final pass)")
+        print(f"[INFO]: Final pass uploaded {uploaded2} item(s).")
+
+    def discover_inputs(self) -> list[Path]:
+        files: list[Path] = []
+        if self.input_dir.is_file():
+            assert self.input_dir.suffix.lower() in {".npy", ".npz"}
+            files.append(self._rename_if_needed(self.input_dir))
+        else:
+            if self.args.recursive:
+                for root, _, fnames in os.walk(self.input_dir):
+                    root_path = Path(root)
+                    for fn in fnames:
+                        if fn.endswith(".npy") or fn.endswith(".npz"):
+                            files.append(self._rename_if_needed(root_path / fn))
+            else:
+                for fn in os.listdir(self.input_dir):
+                    if fn.endswith(".npy") or fn.endswith(".npz"):
+                        files.append(self._rename_if_needed(self.input_dir / fn))
+        files = sorted(files)
+        # Read-only backup of full relative list for final verification usage
+        try:
+            self._all_inputs_rel = [p.relative_to(self.base_root).as_posix() for p in files]
+        except Exception:
+            self._all_inputs_rel = []
+        assert len(files) > 0, f"No .npy/.npz files found in {self.input_dir}"
+        print(f"[INFO]: Found {len(files)} PHUMA file(s) in {self.input_dir} (recursive={self.args.recursive})")
+        return files
+
+    def run(self, sim: sim_utils.SimulationContext, scene: InteractiveScene, joint_names: list[str]) -> None:
+        self.processed.load()
+        if self.args.sync_from_wandb:
+            self.wandb.sync(self.processed, self.output_dir)
+        # Compute missing and adjust processed list
+        missing_set = self._compute_missing_and_update()
+        # Prepare exporter and inputs
+        exporter = MotionExporter(sim, scene, joint_names, self.output_dir, self.processed)
+        files = self.discover_inputs()
+        files = self._prioritize_files(files, missing_set)
+        # Process and upload
+        uploaded = self._process_and_upload(exporter, files, desc="Uploading to WandB")
         print(f"[INFO]: Saved processed list to {self.processed.path}")
         print(f"[INFO]: Successfully uploaded {uploaded} item(s).")
+        # Remove missing list after prioritized processing
+        missing_list_path = (self.processed.path.parent / self.args.missing_list_name)
+        if missing_list_path.exists():
+            try:
+                missing_list_path.unlink()
+                print(f"[INFO]: Removed missing list file {missing_list_path}")
+            except Exception as e:
+                print(f"[WARN]: Failed to remove missing list file: {e}")
+        # Final validation and re-process remaining missing motions
+        self._final_verify_and_reprocess(exporter)
 
 
 import os
@@ -648,6 +884,7 @@ from isaaclab.app import AppLauncher
 import tempfile
 import shutil
 import os as _os
+import re as _re
 
 # Suppress W&B console noise
 _os.environ.setdefault("WANDB_SILENT", "true")  # set to true to suppress wandb console output
@@ -732,27 +969,22 @@ parser.add_argument(
 parser.add_argument(
     "--verify_uploaded",
     action="store_true",
-    help="Verify entries in processed_motions.txt exist in WandB registry (writes a missing list).",
+    default=False,
+    help="Verify entries in processed_motions.txt exist in WandB registry (writes a remotely-missing list).",
 )
 parser.add_argument(
     "--missing_list_name",
     type=str,
     default="missing_in_wandb.txt",
-    help="Filename to write motions not found in WandB registry (relative to input root). Default: missing_in_wandb.txt",
+    help="Filename to write motions remotely-missing in WandB registry (relative to input root). Default: missing_in_wandb.txt",
 )
 parser.add_argument(
     "--sync_workers",
     type=int,
     default=8,
-    help="Number of parallel workers to download missing files during sync.",
+    help="Number of parallel workers to download locally-missing files during sync.",
 )
-parser.add_argument(
-    "--no-verify-uploaded",
-    dest="verify_uploaded",
-    action="store_false",
-    help="Disable verification step against WandB registry.",
-)
-parser.set_defaults(verify_uploaded=True)
+
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -1121,11 +1353,65 @@ def _append_with_lock(file_path: Path, text: str) -> None:
             pass
 
 
+def _rewrite_excluding_with_lock(file_path: Path, rels_to_remove: set[str]) -> None:
+    """Rewrite file excluding given entries with an exclusive lock (best-effort, POSIX)."""
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: list[str] = []
+    try:
+        with open(file_path, "r", encoding="utf-8") as rf:
+            existing = [line.rstrip("\n") for line in rf if line.strip()]
+    except FileNotFoundError:
+        existing = []
+    remaining = [line for line in existing if line not in rels_to_remove]
+    with open(file_path, "w", encoding="utf-8") as f:
+        try:
+            import fcntl  # POSIX only
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except Exception:
+            pass
+        for line in remaining:
+            f.write(line + "\n")
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+        try:
+            import fcntl  # re-import inside scope for mypy
+            fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception:
+            pass
+
+
+def _sanitize_basename(name: str) -> str:
+    """Sanitize a filename (basename only) to be WandB-safe and avoid '__' sequences.
+    - Remove '+' and '?' explicitly.
+    - Replace any other disallowed characters with '_'.
+    - Collapse consecutive underscores to a single '_' to avoid '__' inside filenames.
+    """
+    # Remove explicit symbols
+    name = name.replace("+", "").replace("?", "")
+    # Replace disallowed chars with underscore (allow alnum, '-', '_', and '.')
+    name = "".join(ch if (_re.match(r"[A-Za-z0-9._-]", ch)) else "_" for ch in name)
+    # Collapse multiple underscores
+    name = _re.sub(r"_+", "_", name)
+    return name
+
+
+def sanitize_rel_path(rel_path: str) -> str:
+    """Sanitize only the basename of a relative path string."""
+    p = Path(rel_path)
+    new_name = _sanitize_basename(p.name)
+    if new_name == p.name:
+        return rel_path
+    return str(p.with_name(new_name))
+
+
 def _sync_processed_from_wandb(
     out_txt: Path, processed_rel_set: set[str], processed_stem_set: set[str], output_dir: Path, registry_cfg: dict | None = None
 ) -> None:
     """Sync processed list and local files from WandB REGISTRY (artifact collections).
-    If an entry exists on WandB but the local output file is missing, download it to output_dir/rel_path."""
+    If an entry exists on WandB but the local output file is locally-missing, download it to output_dir/rel_path."""
     try:
         cfg = registry_cfg or {
             "entity": args_cli.wandb_entity,
