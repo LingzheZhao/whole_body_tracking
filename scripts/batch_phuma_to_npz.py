@@ -189,14 +189,14 @@ class BatchPhumaProcessor:
             rel = p.relative_to(self.base_root).as_posix()
             return (0 if rel in missing_set else 1, rel)
 
-        print(f"[INFO]: Prioritizing {len(files)}")
+        print(f"[INFO]: Prioritizing {len(missing_set)}")
         return sorted(files, key=_priority_key)
 
     def _process_and_upload(self, exporter: "MotionExporter", files: list[Path], desc: str = "Uploading to WandB") -> int:
         import multiprocessing as _mp  # avoid early import issues
         pool = _mp.Pool(processes=max(1, int(self.args.upload_workers)))
         pending: list[tuple[str, "_mp.pool.ApplyResult"]] = []  # type: ignore[name-defined]
-        for f in files:
+        for f in _progress_iter(files, total=len(files), desc="Export & queue uploads"):
             rel = f.relative_to(self.base_root).as_posix()
             if self.processed.contains(rel):
                 continue
