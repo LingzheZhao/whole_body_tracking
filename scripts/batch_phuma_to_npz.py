@@ -9,15 +9,6 @@ Overview
 - Supports parallelism by increasing '--upload_workers', '--sync_workers' to alleviate network bottlenecks.
 - Automatically sanitize input file names from special characters.
 
-Resumable Processing
-- processed_motions.txt records relative paths (with extensions). On restart, those entries are skipped.
-- Entries are appended immediately after local save to reflect real-time progress.
-- File writes use a best-effort POSIX lock to reduce risk of corruption under multi-process/multi-instance writes.
-- Supports startup synchronization with WandB to hydrate processed list and download locally-missing npz.
-- Supports verification of uploaded entries against WandB registry (writes a remotely-missing list).
-- Final check of any missing entries against the input dataset and re-process them.
-
-
 Key Arguments
 - --input_dir: File or directory containing PHUMA .npy/.npz.
 - --recursive/--no-recursive: Whether to walk subdirectories.
@@ -58,6 +49,19 @@ Resumable Processing
 - processed_motions.txt records relative paths (with extensions). On restart, those entries are skipped.
 - Entries are appended immediately after local save to reflect real-time progress.
 - File writes use a best-effort POSIX lock to reduce risk of corruption under multi-process/multi-instance writes.
+- Supports startup synchronization with WandB to hydrate processed list and download locally-missing npz.
+- Supports verification of uploaded entries against WandB registry (writes a remotely-missing list).
+- Final check of any missing entries against the input dataset and re-process them.
+
+Sharding
+- Supports sharding the dataset by top-level subdirectory into N shards (default: 1 = no sharding).
+- Only effective when --num_shards > 1.
+- Each shard is processed independently and the results are aggregated.
+- The shard index is in [0, num_shards).
+- The shard index is determined by the md5 hash of the top-level subdirectory.
+- How to use:
+  - Run the script N times, with --num_shards N and --shard_index K for the K-th shard, K is in [0, N).
+
 
 Notices
 - Entity vs Organization:
@@ -196,13 +200,25 @@ class BatchPhumaProcessor:
         import multiprocessing as _mp  # avoid early import issues
         pool = _mp.Pool(processes=max(1, int(self.args.upload_workers)))
         pending: list[tuple[str, "_mp.pool.ApplyResult"]] = []  # type: ignore[name-defined]
+        failed_count = 0
+        failed_log = (self.processed.path.parent / "failed_motions.txt")
+
+        def _log_failure(rel: str, reason: str) -> None:
+            try:
+                _append_with_lock(failed_log, f"{reason}:{rel}\n")
+            except Exception as _e:
+                print(f"[WARN]: Failed to append failure log for {rel}: {_e}")
+
         for f in _progress_iter(files, total=len(files), desc="Export & queue uploads"):
             rel = f.relative_to(self.base_root).as_posix()
-            if self.processed.contains(rel):
-                continue
+            # if self.processed.contains(rel):
+            #     continue
             saved = exporter.export(f, rel)
             if saved is not None:
                 pending.append((rel, self.wandb.upload_async(pool, saved, rel)))
+            else:
+                failed_count += 1
+                _log_failure(rel, "export")
         pool.close()
         uploaded = 0
         for _rel, _res in pending:
@@ -211,6 +227,8 @@ class BatchPhumaProcessor:
         for rel, ok in _drain_results(pending, total=len(pending), desc=desc):
             if not ok:
                 print(f"[WARN]: Upload failed for {rel}")
+                failed_count += 1
+                _log_failure(rel, "upload")
             if ok:
                 uploaded += 1
             else:
@@ -220,6 +238,8 @@ class BatchPhumaProcessor:
                 except Exception as _e:
                     print(f"[WARN]: Failed to roll back processed entry {rel}: {_e}")
         pool.join()
+        if failed_count > 0:
+            print(f"[INFO]: Logged {failed_count} failure case(s) to {failed_log}")
         return uploaded
 
     def _final_verify_and_reprocess(self, exporter: "MotionExporter") -> None:
@@ -268,6 +288,36 @@ class BatchPhumaProcessor:
                     if fn.endswith(".npy") or fn.endswith(".npz"):
                         files.append(self._rename_if_needed(self.input_dir / fn))
         files = sorted(files)
+        # Shard by top-level subdirectory if requested
+        if int(self.args.num_shards) > 1:
+            num_shards = max(1, int(self.args.num_shards))
+            shard_index = max(0, int(self.args.shard_index))
+            shard_index = shard_index % num_shards
+            total = len(files)
+
+            def _subdir_key(p: Path) -> str:
+                rel = p.relative_to(self.base_root).as_posix()
+                return rel.split("/", 1)[0] if "/" in rel else ""
+            # Build mapping subdir -> files
+            subdir_to_files: dict[str, list[Path]] = {}
+            for p in files:
+                k = _subdir_key(p)
+                subdir_to_files.setdefault(k, []).append(p)
+            # Greedy balance subdirs by size across shards
+            counts = sorted(((k, len(v)) for k, v in subdir_to_files.items()), key=lambda x: x[1], reverse=True)
+            shard_totals: list[int] = [0 for _ in range(num_shards)]
+            shard_keys: list[list[str]] = [[] for _ in range(num_shards)]
+            for k, c in counts:
+                idx = shard_totals.index(min(shard_totals))
+                shard_totals[idx] += c
+                shard_keys[idx].append(k)
+            assigned = set(shard_keys[shard_index])
+            selected: list[Path] = []
+            for k in assigned:
+                selected.extend(subdir_to_files.get(k, []))
+            print(f"[INFO]: Balanced sharding by top-level subdir {shard_index}/{num_shards}. "
+                  f"Selected {len(selected)}/{total} files from {len(subdir_to_files)} unique subdirs.")
+            files = selected
         # Read-only backup of full relative list for final verification usage
         try:
             self._all_inputs_rel = [p.relative_to(self.base_root).as_posix() for p in files]
@@ -393,6 +443,18 @@ parser.add_argument(
     type=int,
     default=8,
     help="Number of parallel workers to download locally-missing files during sync.",
+)
+parser.add_argument(
+    "--num_shards",
+    type=int,
+    default=1,
+    help="Shard the dataset by top-level subdirectory into N shards (default: 1 = no sharding).",
+)
+parser.add_argument(
+    "--shard_index",
+    type=int,
+    default=0,
+    help="This process's shard index in [0, num_shards). Only effective when --num_shards > 1.",
 )
 
 
