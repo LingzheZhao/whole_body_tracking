@@ -65,7 +65,7 @@ from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_moti
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play with RSL-RL agent."""
-    agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
+    agent_cfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
     # specify directory for logging experiments
@@ -110,6 +110,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
 
+    # Fallback: if motion file is still not set, try CLI override, then try reading from saved env.yaml
+    if getattr(args_cli, "motion_file", None):
+        print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
+        env_cfg.commands.motion.motion_file = args_cli.motion_file
+    if not getattr(env_cfg.commands.motion, "motion_file", None):
+        try:
+            import yaml  # type: ignore
+            log_dir = os.path.dirname(resume_path)
+            env_yaml_path = os.path.join(log_dir, "params", "env.yaml")
+            if os.path.isfile(env_yaml_path):
+                with open(env_yaml_path, "r") as f:
+                    y = yaml.safe_load(f)
+                mf = y.get("commands", {}).get("motion", {}).get("motion_file")
+                if isinstance(mf, str) and len(mf) > 0:
+                    if os.path.isfile(mf):
+                        env_cfg.commands.motion.motion_file = mf
+                        print(f"[INFO]: Restored motion file from saved env.yaml: {mf}")
+                    else:
+                        print(f"[WARN]: Motion file from env.yaml not found on disk: {mf}")
+        except Exception as _e:
+            print(f"[WARN]: Failed to restore motion file from env.yaml: {_e}")
+    # Final guard
+    assert getattr(env_cfg.commands.motion, "motion_file", None), (
+        "commands.motion.motion_file is not set. "
+        "Please provide --motion_file, or use --wandb_path with a run that has a 'motions' artifact, "
+        "or ensure logs/<exp>/params/env.yaml contains a valid motion_file path."
+    )
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
@@ -136,13 +164,57 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
+
+    def _fix_and_reload_for_obs_norm(_src_path: str):
+        print("[WARN]: Applying backward-compatible fallback for obs_normalizer state.")
+        import torch as _torch  # avoid top-level import side-effects
+        ckpt = _torch.load(_src_path, map_location=agent_cfg.device)
+        # Use current runner's normalizer default state_dict to ensure required keys/shapes exist.
+        try:
+            default_state = ppo_runner.obs_normalizer.state_dict()
+        except Exception:
+            default_state = {}
+        ckpt["obs_norm_state_dict"] = default_state
+        # Also patch privileged observation normalizer if expected by newer runners
+        try:
+            priv_default_state = (
+                ppo_runner.privileged_obs_normalizer.state_dict()
+                if hasattr(ppo_runner, "privileged_obs_normalizer") and ppo_runner.privileged_obs_normalizer is not None
+                else {}
+            )
+        except Exception:
+            priv_default_state = {}
+        ckpt["privileged_obs_norm_state_dict"] = priv_default_state
+        tmp_dir = os.path.join(os.path.dirname(_src_path), "tmp_fix")
+        os.makedirs(tmp_dir, exist_ok=True)
+        fixed_path = os.path.join(tmp_dir, os.path.basename(_src_path))
+        _torch.save(ckpt, fixed_path)
+        ppo_runner.load(fixed_path)
+
+    try:
+        ppo_runner.load(resume_path)
+    except KeyError as _e:
+        if "obs_norm_state_dict" in str(_e):
+            _fix_and_reload_for_obs_norm(resume_path)
+        else:
+            raise
+    except RuntimeError as _e:
+        # Handle missing keys in EmpiricalNormalization state_dict on older checkpoints
+        emsg = str(_e)
+        if "EmpiricalNormalization" in emsg or "Missing key(s) in state_dict" in emsg:
+            _fix_and_reload_for_obs_norm(resume_path)
+        else:
+            raise
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+
+    # if no such attribute
+    if not hasattr(ppo_runner, "obs_normalizer") or ppo_runner.obs_normalizer is None:
+        ppo_runner.obs_normalizer = torch.nn.Identity().to(ppo_runner.device)  # no normalization
 
     export_motion_policy_as_onnx(
         env.unwrapped,
@@ -175,6 +247,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
 if __name__ == "__main__":
     # run the main function
-    main()
+    main()  # type: ignore
     # close sim app
     simulation_app.close()
